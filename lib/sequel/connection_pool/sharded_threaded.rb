@@ -211,5 +211,5 @@ class Sequel::ShardedThreadedConnectionPool < Sequel::ThreadedConnectionPool
     @disconnection_proc.call(conn) if @disconnection_proc
   end
   
-  CONNECTION_POOL_MAP[[false, true]] = self
+  CONNECTION_POOL_MAP[[:multi, true]] = self
 end

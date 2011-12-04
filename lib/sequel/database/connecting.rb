@@ -11,6 +11,9 @@ module Sequel
     # Whether to use the single threaded connection pool by default
     @@single_threaded = false
 
+    # Whether to use the fibered connection pool by default
+    @@fibered = false
+    
     # The Database subclass for the given adapter scheme.
     # Raises Sequel::AdapterNotFound if the adapter
     # could not be loaded.
@@ -87,6 +90,12 @@ module Sequel
     # See Sequel.single_threaded=.
     def self.single_threaded=(value)
       @@single_threaded = value
+    end
+
+    # Sets the default fibered mode for new databases.
+    # See Sequel.fibered=.
+    def self.fibered=(value)
+      @@fibered = value
     end
 
     # Sets the adapter scheme for the Database class. Call this method in

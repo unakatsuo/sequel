@@ -118,5 +118,5 @@ class Sequel::FiberedConnectionPool < Sequel::ConnectionPool
     end
   end
 
-  CONNECTION_POOL_MAP[[false, false]] = self
+  CONNECTION_POOL_MAP[[:fiber, false]] = self
 end

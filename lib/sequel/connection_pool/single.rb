@@ -26,5 +26,5 @@ class Sequel::SingleConnectionPool < Sequel::ConnectionPool
     end
   end
 
-  CONNECTION_POOL_MAP[[true, false]] = self
+  CONNECTION_POOL_MAP[[:single, false]] = self
 end

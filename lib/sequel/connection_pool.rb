@@ -26,11 +26,12 @@ class Sequel::ConnectionPool
   # The default server to use
   DEFAULT_SERVER = :default
   
-  # A map of [single threaded, sharded] values to symbols or ConnectionPool subclasses.
-  CONNECTION_POOL_MAP = {[true, false] => :single, 
-    [true, true] => :sharded_single,
-    [false, false] => :threaded,
-    [false, true] => :sharded_threaded}
+  # A map of [thread model, sharded] values to symbols or ConnectionPool subclasses.
+  CONNECTION_POOL_MAP = {[:single, false] => :single, 
+    [:single, true] => :sharded_single,
+    [:multi, false] => :threaded,
+    [:multi, true] => :sharded_threaded,
+    [:fiber, false] => :fibered}
   
   # Class methods used to return an appropriate pool subclass, separated
   # into a module for easier overridding by extensions.
@@ -38,7 +39,7 @@ class Sequel::ConnectionPool
     # Return a pool subclass instance based on the given options.  If a <tt>:pool_class</tt>
     # option is provided is provided, use that pool class, otherwise
     # use a new instance of an appropriate pool subclass based on the
-    # <tt>:single_threaded</tt> and <tt>:servers</tt> options.
+    # <tt>:single_threaded</tt>, <tt>:servers</tt> and <tt>:fibered</tt> options.
     def get_pool(opts = {}, &block)
       case v = connection_pool_class(opts)
       when Class
@@ -53,7 +54,8 @@ class Sequel::ConnectionPool
     
     # Return a connection pool class based on the given options.
     def connection_pool_class(opts)
-      CONNECTION_POOL_MAP[opts[:pool_class]] || opts[:pool_class] || CONNECTION_POOL_MAP[[!!opts[:single_threaded], !!opts[:servers]]]
+      tmodel = !!opts[:fibered] ? :fiber : (!!opts[:single_threaded] ? :single : :multi)
+      CONNECTION_POOL_MAP[opts[:pool_class]] || opts[:pool_class] || CONNECTION_POOL_MAP[[tmodel, !!opts[:servers]]]
     end
   end
   extend ClassMethods

@@ -84,5 +84,5 @@ class Sequel::ShardedSingleConnectionPool < Sequel::ConnectionPool
     end
   end
   
-  CONNECTION_POOL_MAP[[true, true]] = self
+  CONNECTION_POOL_MAP[[:single, true]] = self
 end

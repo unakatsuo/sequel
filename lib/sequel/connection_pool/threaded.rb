@@ -147,5 +147,5 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
     @mutex.synchronize{yield}
   end
   
-  CONNECTION_POOL_MAP[[false, false]] = self
+  CONNECTION_POOL_MAP[[:multi, false]] = self
 end

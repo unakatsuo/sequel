@@ -35,6 +35,7 @@ module Sequel
     # :quote_identifiers :: Whether to quote identifiers
     # :servers :: A hash specifying a server/shard specific options, keyed by shard symbol 
     # :single_threaded :: Whether to use a single-threaded connection pool
+    # :fibered :: Whether to use a fibered connection pool
     # :sql_log_level :: Method to use to log SQL to a logger, :info by default.
     #
     # All options given are also passed to the connection pool.  If a block
@@ -50,6 +51,7 @@ module Sequel
       @opts[:adapter_class] = self.class
       
       @opts[:single_threaded] = @single_threaded = typecast_value_boolean(@opts.fetch(:single_threaded, @@single_threaded))
+      @opts[:fibered] = @fibered = typecast_value_boolean(@opts.fetch(:fibered, @@fibered))
       @schemas = {}
       @default_schema = @opts.fetch(:default_schema, default_schema_default)
       @prepared_statements = {}
