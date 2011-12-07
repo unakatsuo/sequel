@@ -45,7 +45,12 @@ module Sequel
         opts = server_opts(server)
         opts[:host] ||= 'localhost'
         opts[:username] ||= opts[:user]
-        conn = ::Mysql2::Client.new(opts)
+        conn = if opts[:fibered]
+                 require 'mysql2/em_fiber'
+                 ::Mysql2::EM::Fiber::Client.new(opts)
+               else
+                 ::Mysql2::Client.new(opts)
+               end
 
         sqls = []
         # Set encoding a slightly different way after connecting,
