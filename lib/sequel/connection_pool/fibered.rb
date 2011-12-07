@@ -67,8 +67,9 @@ class Sequel::FiberedConnectionPool < Sequel::ConnectionPool
   # Note that PoolTimeout error is not handled.
   def hold(server=nil)
     f = Fiber.current
-    
-    return yield(conn) if conn = owned_connection(f)
+
+    conn = owned_connection(f)
+    return yield(conn) if conn
     begin
       conn = acquire(f)
       yield conn
