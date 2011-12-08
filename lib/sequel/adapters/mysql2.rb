@@ -46,8 +46,21 @@ module Sequel
         opts[:host] ||= 'localhost'
         opts[:username] ||= opts[:user]
         conn = if opts[:fibered]
-                 require 'mysql2/em_fiber'
-                 ::Mysql2::EM::Fiber::Client.new(opts)
+                 # mysql2's fiber support had moved to em-synchrony.
+                 # Two gems have to be installed to get fibered driver.
+                 # % gem install em-synchrony mysql2
+                 begin
+                   require 'em-synchrony/mysql2'
+                   ::Mysql2::EM::Client.new(opts)
+                 rescue LoadError
+                   # For mysql2 gem (<=0.3.7)
+                   begin
+                     require 'mysql2/em_fiber'
+                     ::Mysql2::EM::Fiber::Client.new(opts)
+                   rescue LoadError => e
+                     raise e
+                   end
+                 end
                else
                  ::Mysql2::Client.new(opts)
                end
