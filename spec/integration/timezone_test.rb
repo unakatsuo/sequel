@@ -58,7 +58,7 @@ describe "Sequel timezone support" do
     test_timezone
   end
 
-  cspecify "should support using UTC for both database storage and for application", [:swift], [:do, :mysql], [:do, :postgres], [:oracle] do
+  cspecify "should support using UTC for both database storage and for application", [:do, :mysql], [:do, :postgres], [:oracle] do
     Sequel.default_timezone = :utc
     test_timezone
     Sequel.database_timezone = :local
@@ -66,7 +66,7 @@ describe "Sequel timezone support" do
     test_timezone
   end
 
-  cspecify "should support using local time for both database storage and for application", [:do, :mysql], [:do, :postgres], [:oracle] do
+  cspecify "should support using local time for both database storage and for application", [:do, :mysql], [:do, :postgres], [:oracle], [:swift, :postgres], [:swift, :mysql] do
     Sequel.default_timezone = :local
     test_timezone
     Sequel.database_timezone = :utc
@@ -79,7 +79,7 @@ describe "Sequel timezone support" do
     @db.timezone = :local
     t = Time.now
     @db[:t].insert(t)
-    s = @db[:t].get(:t.cast(String))
+    s = @db[:t].get(Sequel.cast(:t, String))
     if o = Date._parse(s)[:offset]
       o.should == t.utc_offset
     end

@@ -13,6 +13,9 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
   attr_reader :allocated
 
   # The following additional options are respected:
+  # * :connection_handling - Set how to handle available connections.  By default,
+  #   uses a a stack for performance.  Can be set to :queue to use a queue, which reduces
+  #   the chances of connections becoming stale.
   # * :max_connections - The maximum number of connections the connection pool
   #   will open (default 4)
   # * :pool_sleep_time - The amount of time to sleep before attempting to acquire
@@ -24,22 +27,40 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
     @max_size = Integer(opts[:max_connections] || 4)
     raise(Sequel::Error, ':max_connections must be positive') if @max_size < 1
     @mutex = Mutex.new  
+    @connection_handling = opts[:connection_handling]
     @available_connections = []
     @allocated = {}
     @timeout = Integer(opts[:pool_timeout] || 5)
     @sleep_time = Float(opts[:pool_sleep_time] || 0.001)
   end
   
-  # The total number of connections opened for the given server, should
-  # be equal to available_connections.length + allocated.length.
+  # The total number of connections opened, either available or allocated.
+  # This may not be completely accurate as it isn't protected by the mutex.
   def size
     @allocated.length + @available_connections.length
   end
   
-  # Removes all connections currently available on all servers, optionally
+  # Yield all of the available connections, and the one currently allocated to
+  # this thread.  This will not yield connections currently allocated to other
+  # threads, as it is not safe to operate on them.  This holds the mutex while
+  # it is yielding all of the available connections, which means that until
+  # the method's block returns, the pool is locked.
+  def all_connections
+    hold do |c|
+      sync do
+        yield c
+        @available_connections.each{|c| yield c}
+      end
+    end
+  end
+  
+  # Removes all connections currently available, optionally
   # yielding each connection to the given block. This method has the effect of 
   # disconnecting from the database, assuming that no connections are currently
-  # being used.
+  # being used.  If you want to be able to disconnect connections that are
+  # currently in use, use the ShardedThreadedConnectionPool, which can do that.
+  # This connection pool does not, for performance reasons. To use the sharded pool,
+  # pass the <tt>:servers=>{}</tt> option when connecting to the database.
   # 
   # Once a connection is requested using #hold, the connection pool
   # creates new connections to the database.
@@ -51,7 +72,7 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
     end
   end
   
-  # Chooses the first available connection to the given server, or if none are
+  # Chooses the first available connection, or if none are
   # available, creates a new connection.  Passes the connection to the supplied
   # block:
   # 
@@ -95,7 +116,7 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
   
   private
 
-  # Assigns a connection to the supplied thread for the given server, if one
+  # Assigns a connection to the supplied thread, if one
   # is available. The calling code should NOT already have the mutex when
   # calling this.
   def acquire(thread)
@@ -106,7 +127,7 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
     end
   end
   
-  # Returns an available connection to the given server. If no connection is
+  # Returns an available connection. If no connection is
   # available, tries to create a new connection. The calling code should already
   # have the mutex before calling this.
   def available
@@ -127,18 +148,25 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
     super if (n || size) < @max_size
   end
   
-  # Returns the connection owned by the supplied thread for the given server,
+  # Returns the connection owned by the supplied thread,
   # if any. The calling code should NOT already have the mutex before calling this.
   def owned_connection(thread)
     sync{@allocated[thread]}
   end
   
-  # Releases the connection assigned to the supplied thread and server. If the
-  # server or connection given is scheduled for disconnection, remove the
-  # connection instead of releasing it back to the pool.
+  # Releases the connection assigned to the supplied thread back to the pool.
   # The calling code should already have the mutex before calling this.
   def release(thread)
-    @available_connections << @allocated.delete(thread)
+    conn = @allocated.delete(thread)
+
+    case @connection_handling
+    when :queue
+      @available_connections.unshift(conn)
+    when :disconnect
+      @disconnection_proc.call(conn) if @disconnection_proc
+    else
+      @available_connections << conn
+    end
   end
 
   # Yield to the block while inside the mutex. The calling code should NOT

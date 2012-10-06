@@ -18,23 +18,6 @@ def logger.method_missing(m, msg)
 end
 MSSQL_DB.loggers = [logger]
 
-MSSQL_DB.create_table! :test do
-  text :name
-  integer :value, :index => true
-end
-MSSQL_DB.create_table! :test2 do
-  text :name
-  integer :value
-end
-MSSQL_DB.create_table! :test3 do
-  integer :value
-  timestamp :time
-end
-MSSQL_DB.create_table! :test4 do
-  varchar :name, :size => 20
-  varbinary :value
-end
-
 describe "A MSSQL database" do
   before do
     @db = MSSQL_DB
@@ -54,19 +37,61 @@ describe "A MSSQL database" do
     proc{@db.server_version}.should_not raise_error
     proc{@db.dataset.server_version}.should_not raise_error
   end
+end
   
+describe "A MSSQL database" do
+  before do
+    @db = MSSQL_DB
+    @db.create_table! :test3 do
+      Integer :value
+      Time :time
+    end
+  end
+  after do
+    @db.drop_table?(:test3)
+  end
+
   specify "should work with NOLOCK" do
     @db.transaction{@db[:test3].nolock.all.should == []}
   end
 end
+
+# This spec is currently disabled as the SQL Server 2008 R2 Express doesn't support
+# full text searching.  Even if full text searching is supported,
+# you may need to create a full text catalog on the database first via:
+#   CREATE FULLTEXT CATALOG ftscd AS DEFAULT
+describe "MSSQL full_text_search" do
+  before do
+    @db = MSSQL_DB
+    @db.drop_table?(:posts)
+  end
+  after do
+    @db.drop_table?(:posts)
+  end
+  
+  specify "should support fulltext indexes and full_text_search" do
+    log do
+      @db.create_table(:posts){Integer :id, :null=>false; String :title; String :body; index :id, :name=>:fts_id_idx, :unique=>true; full_text_index :title, :key_index=>:fts_id_idx; full_text_index [:title, :body], :key_index=>:fts_id_idx}
+      @db[:posts].insert(:title=>'ruby rails', :body=>'y')
+      @db[:posts].insert(:title=>'sequel', :body=>'ruby')
+      @db[:posts].insert(:title=>'ruby scooby', :body=>'x')
+
+      @db[:posts].full_text_search(:title, 'rails').all.should == [{:title=>'ruby rails', :body=>'y'}]
+      @db[:posts].full_text_search([:title, :body], ['sequel', 'ruby']).all.should == [{:title=>'sequel', :body=>'ruby'}]
+
+      @db[:posts].full_text_search(:title, :$n).call(:select, :n=>'rails').should == [{:title=>'ruby rails', :body=>'y'}]
+      @db[:posts].full_text_search(:title, :$n).prepare(:select, :fts_select).call(:n=>'rails').should == [{:title=>'ruby rails', :body=>'y'}]
+    end
+  end
+end if false
 
 describe "MSSQL Dataset#join_table" do
   specify "should emulate the USING clause with ON" do
     MSSQL_DB[:items].join(:categories, [:id]).sql.should ==
       'SELECT * FROM [ITEMS] INNER JOIN [CATEGORIES] ON ([CATEGORIES].[ID] = [ITEMS].[ID])'
     ['SELECT * FROM [ITEMS] INNER JOIN [CATEGORIES] ON (([CATEGORIES].[ID1] = [ITEMS].[ID1]) AND ([CATEGORIES].[ID2] = [ITEMS].[ID2]))',
-     'SELECT * FROM [ITEMS] INNER JOIN [CATEGORIES] ON (([CATEGORIES].[ID2] = [ITEMS].[ID2]) AND ([CATEGORIES].[ID1] = [ITEMS].[ID1]))'].
-    should include(MSSQL_DB[:items].join(:categories, [:id1, :id2]).sql)
+      'SELECT * FROM [ITEMS] INNER JOIN [CATEGORIES] ON (([CATEGORIES].[ID2] = [ITEMS].[ID2]) AND ([CATEGORIES].[ID1] = [ITEMS].[ID1]))'].
+      should include(MSSQL_DB[:items].join(:categories, [:id1, :id2]).sql)
     MSSQL_DB[:items___i].join(:categories___c, [:id]).sql.should ==
       'SELECT * FROM [ITEMS] AS [I] INNER JOIN [CATEGORIES] AS [C] ON ([C].[ID] = [I].[ID])'
   end
@@ -80,14 +105,13 @@ describe "MSSQL Dataset#output" do
     @ds = @db[:items]
   end
   after do
-    @db.drop_table(:items)
-    @db.drop_table(:out)
+    @db.drop_table?(:items, :out)
   end
 
   specify "should format OUTPUT clauses without INTO for DELETE statements" do
     @ds.output(nil, [:deleted__name, :deleted__value]).delete_sql.should =~
       /DELETE FROM \[ITEMS\] OUTPUT \[DELETED\].\[(NAME|VALUE)\], \[DELETED\].\[(NAME|VALUE)\]/
-    @ds.output(nil, [:deleted.*]).delete_sql.should =~
+    @ds.output(nil, [Sequel::SQL::ColumnAll.new(:deleted)]).delete_sql.should =~
       /DELETE FROM \[ITEMS\] OUTPUT \[DELETED\].*/
   end
   
@@ -101,7 +125,7 @@ describe "MSSQL Dataset#output" do
   specify "should format OUTPUT clauses without INTO for INSERT statements" do
     @ds.output(nil, [:inserted__name, :inserted__value]).insert_sql(:name => "name", :value => 1).should =~
       /INSERT INTO \[ITEMS\] \(\[(NAME|VALUE)\], \[(NAME|VALUE)\]\) OUTPUT \[INSERTED\].\[(NAME|VALUE)\], \[INSERTED\].\[(NAME|VALUE)\] VALUES \((N'name'|1), (N'name'|1)\)/
-    @ds.output(nil, [:inserted.*]).insert_sql(:name => "name", :value => 1).should =~
+    @ds.output(nil, [Sequel::SQL::ColumnAll.new(:inserted)]).insert_sql(:name => "name", :value => 1).should =~
       /INSERT INTO \[ITEMS\] \(\[(NAME|VALUE)\], \[(NAME|VALUE)\]\) OUTPUT \[INSERTED\].* VALUES \((N'name'|1), (N'name'|1)\)/
   end
 
@@ -115,7 +139,7 @@ describe "MSSQL Dataset#output" do
   specify "should format OUTPUT clauses without INTO for UPDATE statements" do
     @ds.output(nil, [:inserted__name, :deleted__value]).update_sql(:value => 2).should =~
       /UPDATE \[ITEMS\] SET \[VALUE\] = 2 OUTPUT \[(INSERTED\].\[NAME|DELETED\].\[VALUE)\], \[(INSERTED\].\[NAME|DELETED\].\[VALUE)\]/
-    @ds.output(nil, [:inserted.*]).update_sql(:value => 2).should =~
+    @ds.output(nil, [Sequel::SQL::ColumnAll.new(:inserted)]).update_sql(:value => 2).should =~
       /UPDATE \[ITEMS\] SET \[VALUE\] = 2 OUTPUT \[INSERTED\].*/
   end
 
@@ -219,6 +243,23 @@ describe "MSSQL dataset" do
   end
 end
 
+describe "MSSQL::Dataset#import" do
+  before do
+    @db = MSSQL_DB
+    @db.create_table!(:test){primary_key :x; Integer :y}
+    @db.sqls.clear
+    @ds = @db[:test]
+  end
+  after do
+    @db.drop_table?(:test)
+  end
+  
+  specify "#import should work correctly with an arbitrary output value" do
+    @ds.output(nil, [:inserted__y, :inserted__x]).import([:y], [[3], [4]]).should == [{:y=>3, :x=>1}, {:y=>4, :x=>2}]
+    @ds.all.should == [{:x=>1, :y=>3}, {:x=>2, :y=>4}]
+  end
+end
+
 describe "MSSQL joined datasets" do
   before do
     @db = MSSQL_DB
@@ -245,7 +286,7 @@ describe "Offset support" do
     @ds.import [:id, :parent_id], [[1,nil],[2,nil],[3,1],[4,1],[5,3],[6,5]]
   end
   after do
-    @db.drop_table(:i)
+    @db.drop_table?(:i)
   end
   
   specify "should return correct rows" do
@@ -268,8 +309,7 @@ describe "Common Table Expressions" do
     @ds.import [:id, :parent_id], [[1,nil],[2,nil],[3,1],[4,1],[5,3],[6,5]]
   end
   after do
-    @db.drop_table(:i1)
-    @db.drop_table(:i2)
+    @db.drop_table?(:i1, :i2)
   end
 
   specify "using #with should be able to update" do
@@ -285,7 +325,7 @@ describe "Common Table Expressions" do
 
   specify "using #with_recursive should be able to update" do
     ds = @ds.with_recursive(:t, @ds.filter(:parent_id=>1).or(:id => 1), @ds.join(:t, :i=>:parent_id).select(:i1__id, :i1__parent_id), :args=>[:i, :pi])
-    ds.filter(~{:id => @db[:t].select(:i)}).update(:parent_id => 1)
+    ds.exclude(:id => @db[:t].select(:i)).update(:parent_id => 1)
     @ds[:id => 1].should == {:id => 1, :parent_id => nil}
     @ds[:id => 2].should == {:id => 2, :parent_id => 1}
     @ds[:id => 5].should == {:id => 5, :parent_id => 3}
@@ -335,11 +375,15 @@ describe "MSSSQL::Dataset#insert" do
   before do
     @db = MSSQL_DB
     @db.create_table!(:test5){primary_key :xid; Integer :value}
+    @db.create_table! :test4 do
+      String :name, :size => 20
+      column :value, 'varbinary(max)'
+    end
     @db.sqls.clear
     @ds = @db[:test5]
   end
   after do
-    @db.drop_table(:test5) rescue nil
+    @db.drop_table?(:test5, :test4)
   end
 
   specify "should have insert_select return nil if disable_insert_output is used" do
@@ -356,11 +400,17 @@ describe "MSSSQL::Dataset#insert" do
     h[:value].should == 10
     @ds.first(:xid=>h[:xid])[:value].should == 10
   end
-end
 
-describe "MSSSQL::Dataset#disable_insert_output" do
+  cspecify "should allow large text and binary values", :odbc do
+    blob = Sequel::SQL::Blob.new("0" * (65*1024))
+    @db[:test4].insert(:name => 'max varbinary test', :value => blob)
+    b = @db[:test4].where(:name => 'max varbinary test').get(:value)
+    b.length.should == blob.length
+    b.should == blob
+  end
+
   specify "should play nicely with simple_select_all?" do
-    MSSQL_DB[:test].disable_insert_output.send(:simple_select_all?).should == true
+    MSSQL_DB[:test4].disable_insert_output.send(:simple_select_all?).should == true
   end
 end
 
@@ -378,8 +428,7 @@ describe "MSSSQL::Dataset#into" do
     @db[:t].insert(:id => 1, :value => "test")
     @db << @db[:t].into(:new).select_sql
     @db[:new].all.should == [{:id => 1, :value => "test"}]
-    @db.drop_table(:t)
-    @db.drop_table(:new)
+    @db.drop_table?(:t, :new)
   end
 end
 
@@ -388,7 +437,7 @@ describe "A MSSQL database" do
     @db = MSSQL_DB
   end
   after do
-    @db.drop_table(:a)
+    @db.drop_table?(:a)
   end
   
   specify "should handle many existing types for set_column_allow_null" do
@@ -410,16 +459,20 @@ describe "A MSSQL database" do
 end
 
 describe "MSSQL::Database#rename_table" do
+  after do
+    MSSQL_DB.drop_table?(:foo)
+  end
+
   specify "should work on non-schema bound tables which need escaping" do
     MSSQL_DB.quote_identifiers = true
     MSSQL_DB.create_table! :'foo bar' do
       text :name
     end
-    MSSQL_DB.drop_table :baz rescue nil
-    proc { MSSQL_DB.rename_table 'foo bar', 'baz' }.should_not raise_error
+    MSSQL_DB.drop_table? :foo
+    proc { MSSQL_DB.rename_table 'foo bar', 'foo' }.should_not raise_error
   end
   
-  specify "should workd on schema bound tables" do
+  specify "should work on schema bound tables" do
     MSSQL_DB.execute(<<-SQL)
       IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = 'MY')
         EXECUTE sp_executesql N'create schema MY'
@@ -455,7 +508,7 @@ describe "MSSQL::Database#mssql_unicode_strings = false" do
     MSSQL_DB.mssql_unicode_strings = false
   end
   after do
-    MSSQL_DB.drop_table(:items)
+    MSSQL_DB.drop_table?(:items)
     MSSQL_DB.mssql_unicode_strings = true
   end
 
@@ -474,5 +527,44 @@ describe "MSSQL::Database#mssql_unicode_strings = false" do
     ds.mssql_unicode_strings.should == true
     ds.insert(:name=>'foo')
     ds.select_map(:name).should == ['foo']
+  end
+end
+
+describe "A MSSQL database adds index with include" do
+  before :all do
+    @table_name = :test_index_include
+    @db = MSSQL_DB
+    @db.create_table! @table_name do
+      integer :col1
+      integer :col2
+      integer :col3
+    end
+  end
+
+  after :all do
+    @db.drop_table? @table_name
+  end
+
+  cspecify "should be able add index with include" do
+    @db.alter_table @table_name do
+      add_index [:col1], :include => [:col2,:col3]
+    end
+    @db.indexes(@table_name).should have_key("#{@table_name}_col1_index".to_sym)
+  end
+end
+
+describe "MSSQL::Database#drop_column with a schema" do
+  before do
+    MSSQL_DB.run "create schema test" rescue nil
+  end
+  after do
+    MSSQL_DB.drop_table(:test__items)
+    MSSQL_DB.run "drop schema test" rescue nil
+  end
+
+  specify "drops columns with a default value" do
+    MSSQL_DB.create_table!(:test__items){ Integer :id; String :name, :default => 'widget' }
+    MSSQL_DB.drop_column(:test__items, :name)
+    MSSQL_DB[:test__items].columns.should == [:id]
   end
 end

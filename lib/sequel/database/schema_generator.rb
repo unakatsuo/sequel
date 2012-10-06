@@ -1,20 +1,20 @@
 module Sequel
   # The Schema module holds the schema generators.
   module Schema
-    # Schema::Generator is an internal class that the user is not expected
+    # Schema::CreateTableGenerator is an internal class that the user is not expected
     # to instantiate directly.  Instances are created by Database#create_table.
     # It is used to specify table creation parameters.  It takes a Database
     # object and a block of column/index/constraint specifications, and
     # gives the Database a table description, which the database uses to
     # create a table.
     #
-    # Schema::Generator has some methods but also includes method_missing,
+    # Schema::CreateTableGenerator has some methods but also includes method_missing,
     # allowing users to specify column type as a method instead of using
     # the column method, which makes for a nicer DSL.
     #
     # For more information on Sequel's support for schema modification, see
-    # the {"Migrations and Schema Modification" guide}[link:files/doc/migration_rdoc.html].
-    class Generator
+    # the {"Schema Modification" guide}[link:files/doc/schema_modification_rdoc.html].
+    class CreateTableGenerator
       # Classes specifying generic types that Sequel will convert to database-specific types.
       GENERIC_TYPES=[String, Integer, Fixnum, Bignum, Float, Numeric, BigDecimal,
       Date, DateTime, Time, File, TrueClass, FalseClass]
@@ -83,7 +83,8 @@ module Sequel
       #                reference table will use for its foreign key a value that does not
       #                exists(yet) on referenced table. Basically it adds
       #                DEFERRABLE INITIALLY DEFERRED on key creation.
-      # :index :: Create an index on this column.
+      # :index :: Create an index on this column.  If given a hash, use the hash as the
+      #           options for the index.
       # :key :: For foreign key columns, the column in the associated table
       #         that this column references.  Unnecessary if this column
       #         references the primary key of the associated table, except if you are
@@ -92,22 +93,20 @@ module Sequel
       #          or not allowing NULL values (if false).  If unspecified, will default
       #          to whatever the database default is.
       # :on_delete :: Specify the behavior of this column when being deleted
-      #               (:restrict, cascade, :set_null, :set_default, :no_action).
+      #               (:restrict, :cascade, :set_null, :set_default, :no_action).
       # :on_update :: Specify the behavior of this column when being updated
-      #               (:restrict, cascade, :set_null, :set_default, :no_action).
+      #               (:restrict, :cascade, :set_null, :set_default, :no_action).
       # :primary_key :: Make the column as a single primary key column.  This should only
       #                 be used if you have a single, nonautoincrementing primary key column.
-      # :size :: The size of the column, generally used with string
-      #          columns to specify the maximum number of characters the column will hold.
-      #          An array of two integers can be provided to set the size and the
-      #          precision, respectively, of decimal columns.
+      # :type :: Overrides the type given as the argument.  Generally not used by column
+      #          itself, but can be passed as an option to other methods that call column.
       # :unique :: Mark the column as unique, generally has the same effect as
       #            creating a unique index on the column.
-      # :unsigned :: Make the column type unsigned, only useful for integer
-      #              columns.
       def column(name, type, opts = {})
         columns << {:name => name, :type => type}.merge(opts)
-        index(name) if opts[:index]
+        if index_opts = opts[:index]
+          index(name, index_opts.is_a?(Hash) ? index_opts : {})
+        end
       end
       
       # Adds a named constraint (or unnamed if name is nil) to the DDL,
@@ -125,6 +124,14 @@ module Sequel
       #   foreign_key(:artist_id) # artist_id INTEGER
       #   foreign_key(:artist_id, :artists) # artist_id INTEGER REFERENCES artists
       #   foreign_key(:artist_id, :artists, :key=>:id) # artist_id INTEGER REFERENCES artists(id)
+      #   foreign_key(:artist_id, :artists, :type=>String) # artist_id varchar(255) REFERENCES artists(id)
+      #
+      # If you want a foreign key constraint without adding a column (usually because it is a
+      # composite foreign key), you can provide an array of columns as the first argument, and
+      # you can provide the :name option to name the constraint:
+      #
+      #   foreign_key([:artist_name, :artist_location], :artists, :name=>:artist_fk)
+      #   # ADD CONSTRAINT artist_fk FOREIGN KEY (artist_name, artist_location) REFERENCES artists
       def foreign_key(name, table=nil, opts = {})
         opts = case table
         when Hash
@@ -141,6 +148,12 @@ module Sequel
       end
 
       # Add a full text index on the given columns to the DDL.
+      #
+      # PostgreSQL specific options:
+      # :language :: Set a language to use for the index (default: simple).
+      #
+      # Microsoft SQL Server specific options:
+      # :key_index :: The KEY INDEX to use for the full text index.
       def full_text_index(columns, opts = {})
         index(columns, opts.merge(:type => :full_text))
       end
@@ -151,11 +164,25 @@ module Sequel
       end
       
       # Add an index on the given column(s) with the given options to the DDL.
-      # The available options are:
+      # General options:
       #
+      # :name :: The name to use for the index. If not given, a default name
+      #          based on the table and columns is used.
       # :type :: The type of index to use (only supported by some databases)
       # :unique :: Make the index unique, so duplicate values are not allowed.
       # :where :: Create a partial index (only supported by some databases)
+      #
+      # PostgreSQL specific options:
+      #
+      # :concurrently :: Create the index concurrently, so it doesn't block
+      #                  operations on the table while the index is being
+      #                  built.
+      # :op_class :: Use a specific operator class in the index.
+      #
+      # Microsoft SQL Server specific options:
+      #
+      # :include :: Include additional column values in the index, without
+      #             actually indexing on those values.
       #
       #   index :name
       #   # CREATE INDEX table_name_index ON table (name)
@@ -231,6 +258,9 @@ module Sequel
       
       add_type_method(*GENERIC_TYPES)
     end
+
+    # Alias of CreateTableGenerator for backwards compatibility.
+    Generator = CreateTableGenerator
   
     # Schema::AlterTableGenerator is an internal class that the user is not expected
     # to instantiate directly.  Instances are created by Database#alter_table.
@@ -240,7 +270,7 @@ module Sequel
     # alter a table's description.
     #
     # For more information on Sequel's support for schema modification, see
-    # the {"Migrations and Schema Modification" guide}[link:files/doc/migration_rdoc.html].
+    # the {"Schema Modification" guide}[link:files/doc/schema_modification_rdoc.html].
     class AlterTableGenerator
       # An array of DDL operations to perform
       attr_reader :operations
@@ -254,7 +284,7 @@ module Sequel
       end
       
       # Add a column with the given name, type, and opts to the DDL for the table.
-      # See Generator#column for the available options.
+      # See CreateTableGenerator#column for the available options.
       #
       #   add_column(:name, String) # ADD COLUMN name varchar(255)
       def add_column(name, type, opts = {})
@@ -262,9 +292,9 @@ module Sequel
       end
       
       # Add a constraint with the given name and args to the DDL for the table.
-      # See Generator#constraint.
+      # See CreateTableGenerator#constraint.
       #
-      #   add_constraint(:valid_name, :name.like('A%'))
+      #   add_constraint(:valid_name, Sequel.like(:name, 'A%'))
       #   # ADD CONSTRAINT valid_name CHECK (name LIKE 'A%')
       def add_constraint(name, *args, &block)
         @operations << {:op => :add_constraint, :name => name, :type => :check, :check => block || args}
@@ -279,37 +309,47 @@ module Sequel
       end
 
       # Add a foreign key with the given name and referencing the given table
-      # to the DDL for the table.  See Generator#column for the available options.
+      # to the DDL for the table.  See CreateTableGenerator#column for the available options.
       #
       # You can also pass an array of column names for creating composite foreign
-      # keys. In this case, it will assume the columns exists and will only add
-      # the constraint.
+      # keys. In this case, it will assume the columns exist and will only add
+      # the constraint.  You can provide a :name option to name the constraint.
       #
       # NOTE: If you need to add a foreign key constraint to a single existing column
       # use the composite key syntax even if it is only one column.
       #
       #   add_foreign_key(:artist_id, :table) # ADD COLUMN artist_id integer REFERENCES table
       #   add_foreign_key([:name], :table) # ADD FOREIGN KEY (name) REFERENCES table
+      #
+      # PostgreSQL specific options:
+      #
+      # :not_valid :: Set to true to add the constraint with the NOT VALID syntax.
+      #               This makes it so that future inserts must respect referential
+      #               integrity, but allows the constraint to be added even if existing
+      #               column values reference rows that do not exist.  After all the
+      #               existing data has been cleaned up, validate_constraint can be used
+      #               to mark the constraint as valid.  Note that this option only makes
+      #               sense when using an array of columns.
       def add_foreign_key(name, table, opts = {})
         return add_composite_foreign_key(name, table, opts) if name.is_a?(Array)
         add_column(name, Integer, {:table=>table}.merge(opts))
       end
       
       # Add a full text index on the given columns to the DDL for the table.
-      # See Generator#index for available options.
+      # See CreateTableGenerator#index for available options.
       def add_full_text_index(columns, opts = {})
         add_index(columns, {:type=>:full_text}.merge(opts))
       end
       
       # Add an index on the given columns to the DDL for the table.  See
-      # Generator#index for available options.
+      # CreateTableGenerator#index for available options.
       #
       #   add_index(:artist_id) # CREATE INDEX table_artist_id_index ON table (artist_id)
       def add_index(columns, opts = {})
         @operations << {:op => :add_index, :columns => Array(columns)}.merge(opts)
       end
       
-      # Add a primary key to the DDL for the table.  See Generator#column
+      # Add a primary key to the DDL for the table.  See CreateTableGenerator#column
       # for the available options.  Like +add_foreign_key+, if you specify
       # the column name as an array, it just creates a constraint:
       #
@@ -322,7 +362,7 @@ module Sequel
       end
       
       # Add a spatial index on the given columns to the DDL for the table.
-      # See Generator#index for available options.
+      # See CreateTableGenerator#index for available options.
       def add_spatial_index(columns, opts = {})
         add_index(columns, {:type=>:spatial}.merge(opts))
       end
@@ -335,7 +375,10 @@ module Sequel
         @operations << {:op => :drop_column, :name => name}.merge(opts)
       end
       
-      # Remove a constraint from the DDL for the table.
+      # Remove a constraint from the DDL for the table. MySQL/SQLite specific options:
+      #
+      # :type :: Set the type of constraint to drop, either :primary_key, :foreign_key,
+      #          or :unique.
       #
       #   drop_constraint(:unique_name) # DROP CONSTRAINT unique_name
       #   drop_constraint(:unique_name, :cascade=>true) # DROP CONSTRAINT unique_name CASCADE
@@ -343,7 +386,17 @@ module Sequel
         @operations << {:op => :drop_constraint, :name => name}.merge(opts)
       end
       
-      # Remove an index from the DDL for the table.
+      # Remove an index from the DDL for the table. General options:
+      #
+      # :name :: The name of the index to drop.  If not given, uses the same name
+      #          that would be used by add_index with the same columns.
+      #
+      # PostgreSQL specific options:
+      #
+      # :cascade :: Cascade the index drop to dependent objects.
+      # :concurrently :: Drop the index using CONCURRENTLY, which doesn't block
+      #                  operations on the table.  Supported in PostgreSQL 9.2+.
+      # :if_exists :: Only drop the index if it already exists.
       #
       #   drop_index(:artist_id) # DROP INDEX table_artist_id_index
       #   drop_index([:a, :b]) # DROP INDEX table_a_b_index
@@ -369,15 +422,26 @@ module Sequel
       # Modify a column's type in the DDL for the table.
       #
       #   set_column_type(:artist_name, 'char(10)') # ALTER COLUMN artist_name TYPE char(10)
+      #
+      # PostgreSQL specific options:
+      #
+      # :using :: Add a USING clause that specifies how to convert existing values to new values.
       def set_column_type(name, type, opts={})
         @operations << {:op => :set_column_type, :name => name, :type => type}.merge(opts)
       end
       
-      # Modify a column's NOT NULL constraint.
+      # Set a given column as allowing NULL values.
       #
-      #   set_column_allow_null(:artist_name, false) # ALTER COLUMN artist_name SET NOT NULL
-      def set_column_allow_null(name, allow_null)
+      #   set_column_allow_null(:artist_name) # ALTER COLUMN artist_name DROP NOT NULL
+      def set_column_allow_null(name, allow_null=true)
         @operations << {:op => :set_column_null, :name => name, :null => allow_null}
+      end
+
+      # Set a given column as not allowing NULL values.
+      #
+      #   set_column_not_null(:artist_name) # ALTER COLUMN artist_name SET NOT NULL
+      def set_column_not_null(name)
+        set_column_allow_null(name, false)
       end
 
       private

@@ -1,4 +1,4 @@
-require 'mysql2' unless defined? Mysql2
+require 'mysql2'
 Sequel.require %w'shared/mysql_prepared_statements', 'adapters'
 
 module Sequel
@@ -8,9 +8,6 @@ module Sequel
     class Database < Sequel::Database
       include Sequel::MySQL::DatabaseMethods
       include Sequel::MySQL::PreparedStatements::DatabaseMethods
-
-      # Mysql::Error messages that indicate the current connection should be disconnected
-      MYSQL_DATABASE_DISCONNECT_ERRORS = /\A(Commands out of sync; you can't run this command now|Can't connect to local MySQL server through socket|MySQL server has gone away|This connection is still waiting for a result, try again once you have the result)/
 
       set_adapter_scheme :mysql2
       
@@ -45,6 +42,7 @@ module Sequel
         opts = server_opts(server)
         opts[:host] ||= 'localhost'
         opts[:username] ||= opts[:user]
+        opts[:flags] = ::Mysql2::Client::FOUND_ROWS if ::Mysql2::Client.const_defined?(:FOUND_ROWS)
         conn = if opts[:fibered]
                  # mysql2's fiber support had moved to em-synchrony.
                  # Two gems have to be installed to get fibered driver.
@@ -64,27 +62,32 @@ module Sequel
                else
                  ::Mysql2::Client.new(opts)
                end
+        conn.query_options.merge!(:symbolize_keys=>true, :cache_rows=>false)
 
-        sqls = []
+        sqls = mysql_connection_setting_sqls
+
         # Set encoding a slightly different way after connecting,
         # in case the READ_DEFAULT_GROUP overrode the provided encoding.
         # Doesn't work across implicit reconnects, but Sequel doesn't turn on
         # that feature.
         if encoding = opts[:encoding] || opts[:charset]
-          sqls << "SET NAMES #{conn.escape(encoding.to_s)}"
+          sqls.unshift("SET NAMES #{conn.escape(encoding.to_s)}")
         end
-
-        # Increase timeout so mysql server doesn't disconnect us.
-        # Value used by default is maximum allowed value on Windows.
-        sqls << "SET @@wait_timeout = #{opts[:timeout] || 2147483}"
-
-        # By default, MySQL 'where id is null' selects the last inserted id
-        sqls << "SET SQL_AUTO_IS_NULL=0" unless opts[:auto_is_null]
 
         sqls.each{|sql| log_yield(sql){conn.query(sql)}}
 
         add_prepared_statements_cache(conn)
         conn
+      end
+
+      # Return the number of matched rows when executing a delete/update statement.
+      def execute_dui(sql, opts={})
+        execute(sql, opts){|c| return c.affected_rows}
+      end
+
+      # Return the last inserted id when executing an insert statement.
+      def execute_insert(sql, opts={})
+        execute(sql, opts){|c| return c.last_id}
       end
 
       # Return the version of the MySQL server two which we are connecting.
@@ -99,7 +102,7 @@ module Sequel
       # yield the connection if a block is given.
       def _execute(conn, sql, opts)
         begin
-          r = log_yield(sql){conn.query(sql, :symbolize_keys => true, :database_timezone => timezone, :application_timezone => Sequel.application_timezone)}
+          r = log_yield((log_sql = opts[:log_sql]) ? sql + log_sql : sql){conn.query(sql, :database_timezone => timezone, :application_timezone => Sequel.application_timezone)}
           if opts[:type] == :select
             yield r if r
           elsif block_given?
@@ -120,8 +123,15 @@ module Sequel
         [::Mysql2::Error]
       end
 
+      # If a connection object is available, try pinging it.  Otherwise, if the
+      # error is a Mysql2::Error, check the SQL state and exception message for
+      # disconnects.
       def disconnect_error?(e, opts)
-        super || (e.is_a?(::Mysql2::Error) && MYSQL_DATABASE_DISCONNECT_ERRORS.match(e.message))
+        super ||
+          ((conn = opts[:conn]) && !conn.ping) ||
+          (e.is_a?(::Mysql2::Error) &&
+            (e.sql_state =~ /\A08/ ||
+             MYSQL_DATABASE_DISCONNECT_ERRORS.match(e.message)))
       end
 
       # The database name when using the native adapter is always stored in
@@ -148,45 +158,40 @@ module Sequel
 
       Database::DatasetClass = self
 
-      # Delete rows matching this dataset
-      def delete
-        execute_dui(delete_sql){|c| return c.affected_rows}
-      end
-
       # Yield all rows matching this dataset.
-      def fetch_rows(sql, &block)
+      def fetch_rows(sql)
         execute(sql) do |r|
-          @columns = r.fields
-          r.each(:cast_booleans => db.convert_tinyint_to_bool, &block)
+          if identifier_output_method
+            cols = r.fields
+            @columns = cols2 = cols.map{|c| output_identifier(c.to_s)}
+            cs = cols.zip(cols2)
+            r.each(:cast_booleans=>convert_tinyint_to_bool?) do |row|
+              h = {}
+              cs.each do |a, b|
+                h[b] = row[a]
+              end
+              yield h
+            end
+          else
+            @columns = r.fields
+            r.each(:cast_booleans=>convert_tinyint_to_bool?){|h| yield h}
+          end
         end
         self
       end
 
-      # Insert a new value into this dataset
-      def insert(*values)
-        execute_dui(insert_sql(*values)){|c| return c.last_id}
-      end
-
-      # Replace (update or insert) the matching row.
-      def replace(*args)
-        execute_dui(replace_sql(*args)){|c| return c.last_id}
-      end
-
-      # Update the matching rows.
-      def update(values={})
-        execute_dui(update_sql(values)){|c| return c.affected_rows}
-      end
-
       private
+
+      # Whether to cast tinyint(1) columns to integer instead of boolean.
+      # By default, uses the opposite of the database's convert_tinyint_to_bool
+      # setting.  Exists for compatibility with the mysql adapter.
+      def convert_tinyint_to_bool?
+        @db.convert_tinyint_to_bool
+      end
 
       # Set the :type option to :select if it hasn't been set.
       def execute(sql, opts={}, &block)
         super(sql, {:type=>:select}.merge(opts), &block)
-      end
-
-      # Set the :type option to :dui if it hasn't been set.
-      def execute_dui(sql, opts={}, &block)
-        super(sql, {:type=>:dui}.merge(opts), &block)
       end
 
       # Handle correct quoting of strings using ::Mysql2::Client#escape.

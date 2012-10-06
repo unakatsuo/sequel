@@ -174,7 +174,7 @@ module Sequel
       # REORG the related table whenever it is altered.  This is not always
       # required, but it is necessary for compatibilty with other Sequel
       # code in many cases.
-      def alter_table(name, generator=nil, &block)
+      def alter_table(name, generator=nil)
         res = super
         reorg(name)
         res
@@ -227,15 +227,20 @@ module Sequel
       # Execute a prepared statement named by name on the database.
       def execute_prepared_statement(ps_name, opts)
         args = opts[:arguments]
-        ps = prepared_statements[ps_name]
+        ps = prepared_statement(ps_name)
         sql = ps.prepared_sql
         synchronize(opts[:server]) do |conn|
           unless conn.prepared_statements.fetch(ps_name, []).first == sql
-            log_yield("Preparing #{ps_name}: #{sql}"){conn.prepare(sql, ps_name)}
+            log_yield("PREPARE #{ps_name}: #{sql}"){conn.prepare(sql, ps_name)}
           end
           args = args.map{|v| v.nil? ? nil : prepared_statement_arg(v)}
-          stmt = log_yield("Executing #{ps_name}: #{args.inspect}"){conn.execute_prepared(ps_name, *args)}
-
+          log_sql = "EXECUTE #{ps_name}"
+          if ps.log_sql
+            log_sql << " ("
+            log_sql << sql
+            log_sql << ")"
+          end
+          stmt = log_yield(log_sql, args){conn.execute_prepared(ps_name, *args)}
           if block_given?
             begin
               yield(stmt)
@@ -439,7 +444,7 @@ module Sequel
         ps.extend(PreparedStatementMethods)
         if name
           ps.prepared_statement_name = name
-          db.prepared_statements[name] = ps
+          db.set_prepared_statement(name, ps)
         end
         ps
       end

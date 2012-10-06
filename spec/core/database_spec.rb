@@ -193,8 +193,7 @@ describe "A new Database" do
   end
 
   specify "should populate :adapter option when using connection string" do
-    Sequel::Database.should_receive(:adapter_class).once.with(:do).and_return(Sequel::Database)
-    Sequel.connect('do:test://host/db_name').opts[:adapter] == :do
+    Sequel.connect('mock:/').opts[:adapter].should == "mock"
   end
 end
 
@@ -325,6 +324,10 @@ describe "Database#uri" do
     @db.uri.should == 'mau://user:pass@localhost:9876/maumau'
   end
   
+  specify "should return nil if a connection uri was not used" do
+    Sequel.mock.uri.should be_nil
+  end
+  
   specify "should be aliased as #url" do
     @db.url.should == 'mau://user:pass@localhost:9876/maumau'
   end
@@ -366,7 +369,7 @@ describe "Database#dataset" do
   end
   
   specify "should provide a filtered #from dataset if a block is given" do
-    d = @db.from(:mau) {:x.sql_number > 100}
+    d = @db.from(:mau){x.sql_number > 100}
     d.should be_a_kind_of(Sequel::Dataset)
     d.sql.should == 'SELECT * FROM mau WHERE (x > 100)'
   end
@@ -413,6 +416,13 @@ describe "Database#extend_datasets" do
     @db.extend_datasets(@m)
   end
   
+  specify "should clear a cached dataset" do
+    @db = Sequel::Database.new
+    @db.literal(1).should == '1'
+    @db.extend_datasets{def literal(v) '2' end}
+    @db.literal(1).should == '2'
+  end
+
   specify "should change the dataset class to a subclass the first time it is called" do
     @db.dataset_class.superclass.should == Sequel::Dataset
   end
@@ -481,6 +491,12 @@ end
 describe "Database#indexes" do
   specify "should raise Sequel::NotImplemented" do
     proc {Sequel::Database.new.indexes(:table)}.should raise_error(Sequel::NotImplemented)
+  end
+end
+
+describe "Database#foreign_key_list" do
+  specify "should raise Sequel::NotImplemented" do
+    proc {Sequel::Database.new.foreign_key_list(:table)}.should raise_error(Sequel::NotImplemented)
   end
 end
 
@@ -566,16 +582,13 @@ describe "Database#table_exists?" do
   specify "should try to select the first record from the table's dataset" do
     db = Sequel.mock(:fetch=>[Sequel::Error, [], [{:a=>1}]])
     db.table_exists?(:a).should be_false
+    db.sqls.should == ["SELECT NULL FROM a LIMIT 1"]
     db.table_exists?(:b).should be_true
     db.table_exists?(:c).should be_true
   end
 end
 
-describe "Database#transaction" do
-  before do
-    @db = Sequel.mock(:servers=>{:test=>{}})
-  end
-  
+shared_examples_for "Database#transaction" do  
   specify "should wrap the supplied block with BEGIN + COMMIT statements" do
     @db.transaction{@db.execute 'DROP TABLE test;'}
     @db.sqls.should == ['BEGIN', 'DROP TABLE test;', 'COMMIT']
@@ -604,6 +617,18 @@ describe "Database#transaction" do
                        'BEGIN', 'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE', 'DROP TABLE serializable', 'COMMIT']
   end
   
+  specify "should support :disconnect=>:retry option for automatically retrying on disconnect" do
+    a = []
+    @db.transaction(:disconnect=>:retry){a << 1; raise Sequel::DatabaseDisconnectError if a.length < 2}
+    @db.sqls.should == ['BEGIN', 'ROLLBACK', 'BEGIN', 'COMMIT']
+    a.should == [1, 1]
+  end
+  
+  specify "should raise an error if attempting to use :disconnect=>:retry inside another transaction" do
+    proc{@db.transaction{@db.transaction(:disconnect=>:retry){}}}.should raise_error(Sequel::Error)
+    @db.sqls.should == ['BEGIN', 'ROLLBACK']
+  end
+  
   specify "should handle returning inside of the block by committing" do
     def @db.ret_commit
       transaction do
@@ -621,6 +646,45 @@ describe "Database#transaction" do
     @db.sqls.should == ['BEGIN', 'DROP TABLE test', 'ROLLBACK']
     
     proc {@db.transaction {raise RuntimeError}}.should raise_error(RuntimeError)
+  end
+  
+  specify "should handle errors when sending BEGIN" do
+    ec = Class.new(StandardError)
+    @db.meta_def(:database_error_classes){[ec]}
+    @db.meta_def(:log_connection_execute){|c, sql| sql =~ /BEGIN/ ? raise(ec, 'bad') : super(c, sql)}
+    begin
+      @db.transaction{@db.execute 'DROP TABLE test;'}
+    rescue Sequel::DatabaseError => e
+    end
+    e.should_not be_nil
+    e.wrapped_exception.should be_a_kind_of(ec)
+    @db.sqls.should == ['ROLLBACK']
+  end
+  
+  specify "should handle errors when sending COMMIT" do
+    ec = Class.new(StandardError)
+    @db.meta_def(:database_error_classes){[ec]}
+    @db.meta_def(:log_connection_execute){|c, sql| sql =~ /COMMIT/ ? raise(ec, 'bad') : super(c, sql)}
+    begin
+      @db.transaction{@db.execute 'DROP TABLE test;'}
+    rescue Sequel::DatabaseError => e
+    end
+    e.should_not be_nil
+    e.wrapped_exception.should be_a_kind_of(ec)
+    @db.sqls.should == ['BEGIN', 'DROP TABLE test;']
+  end
+  
+  specify "should handle errors when sending ROLLBACK" do
+    ec = Class.new(StandardError)
+    @db.meta_def(:database_error_classes){[ec]}
+    @db.meta_def(:log_connection_execute){|c, sql| sql =~ /ROLLBACK/ ? raise(ec, 'bad') : super(c, sql)}
+    begin
+      @db.transaction{raise ArgumentError, 'asdf'}
+    rescue Sequel::DatabaseError => e
+    end
+    e.should_not be_nil
+    e.wrapped_exception.should be_a_kind_of(ec)
+    @db.sqls.should == ['BEGIN']
   end
   
   specify "should issue ROLLBACK if Sequel::Rollback is called in the transaction" do
@@ -699,7 +763,7 @@ describe "Database#transaction" do
     q1.pop
     cc.should be_a_kind_of(Sequel::Mock::Connection)
     tr = @db.instance_variable_get(:@transactions)
-    tr.should == {cc=>{:savepoint_level=>1}}
+    tr.keys.should == [cc]
     q.push nil
     t.join
     tr.should be_empty
@@ -796,6 +860,26 @@ describe "Database#transaction" do
     @db.sqls.should == ['BEGIN', 'ROLLBACK', 'foo']
   end
 
+  specify "should raise an error if you attempt to use after_commit inside a prepared transaction" do
+    @db.meta_def(:supports_prepared_transactions?){true}
+    proc{@db.transaction(:prepare=>'XYZ'){@db.after_commit{@db.execute('foo')}}}.should raise_error(Sequel::Error)
+    @db.sqls.should == ['BEGIN', 'ROLLBACK']
+  end
+
+  specify "should raise an error if you attempt to use after_rollback inside a prepared transaction" do
+    @db.meta_def(:supports_prepared_transactions?){true}
+    proc{@db.transaction(:prepare=>'XYZ'){@db.after_rollback{@db.execute('foo')}}}.should raise_error(Sequel::Error)
+    @db.sqls.should == ['BEGIN', 'ROLLBACK']
+  end
+end
+
+describe "Database#transaction with savepoint support" do
+  before do
+    @db = Sequel.mock(:servers=>{:test=>{}})
+  end
+
+  it_should_behave_like "Database#transaction"
+
   specify "should support after_commit inside savepoints" do
     @db.meta_def(:supports_savepoints?){true}
     @db.transaction do
@@ -817,18 +901,6 @@ describe "Database#transaction" do
     @db.sqls.should == ['BEGIN', 'SAVEPOINT autopoint_1', 'RELEASE SAVEPOINT autopoint_1', 'ROLLBACK', 'foo', 'bar', 'baz']
   end
 
-  specify "should raise an error if you attempt to use after_commit inside a prepared transaction" do
-    @db.meta_def(:supports_prepared_transactions?){true}
-    proc{@db.transaction(:prepare=>'XYZ'){@db.after_commit{@db.execute('foo')}}}.should raise_error(Sequel::Error)
-    @db.sqls.should == ['BEGIN', 'ROLLBACK']
-  end
-
-  specify "should raise an error if you attempt to use after_rollback inside a prepared transaction" do
-    @db.meta_def(:supports_prepared_transactions?){true}
-    proc{@db.transaction(:prepare=>'XYZ'){@db.after_rollback{@db.execute('foo')}}}.should raise_error(Sequel::Error)
-    @db.sqls.should == ['BEGIN', 'ROLLBACK']
-  end
-
   specify "should raise an error if you attempt to use after_commit inside a savepoint in a prepared transaction" do
     @db.meta_def(:supports_savepoints?){true}
     @db.meta_def(:supports_prepared_transactions?){true}
@@ -843,7 +915,16 @@ describe "Database#transaction" do
     @db.sqls.should == ['BEGIN', 'SAVEPOINT autopoint_1','ROLLBACK TO SAVEPOINT autopoint_1', 'ROLLBACK']
   end
 end
+  
+describe "Database#transaction without savepoint support" do
+  before do
+    @db = Sequel.mock(:servers=>{:test=>{}})
+    @db.meta_def(:supports_savepoints?){false}
+  end
 
+  it_should_behave_like "Database#transaction"
+end
+  
 describe "Sequel.transaction" do
   before do
     @sqls = []
@@ -1047,21 +1128,20 @@ describe "A Database adapter with a scheme" do
     proc {Sequel.ccc('abc', 'def')}.should raise_error(Sequel::Error)
     
     c = Sequel.ccc('mydb')
-    p = proc{c.opts.delete_if{|k,v| k == :disconnection_proc || k == :single_threaded}}
     c.should be_a_kind_of(@ccc)
-    p.call.should == {:adapter=>:ccc, :database => 'mydb', :adapter_class=>@ccc}
+    c.opts.values_at(:adapter, :database, :adapter_class).should == [:ccc, 'mydb', @ccc]
     
     c = Sequel.ccc('mydb', :host => 'localhost')
     c.should be_a_kind_of(@ccc)
-    p.call.should == {:adapter=>:ccc, :database => 'mydb', :host => 'localhost', :adapter_class=>@ccc}
+    c.opts.values_at(:adapter, :database, :host, :adapter_class).should == [:ccc, 'mydb', 'localhost', @ccc]
     
     c = Sequel.ccc
     c.should be_a_kind_of(@ccc)
-    p.call.should == {:adapter=>:ccc, :adapter_class=>@ccc}
+    c.opts.values_at(:adapter, :adapter_class).should == [:ccc, @ccc]
     
     c = Sequel.ccc(:database => 'mydb', :host => 'localhost')
     c.should be_a_kind_of(@ccc)
-    p.call.should == {:adapter=>:ccc, :database => 'mydb', :host => 'localhost', :adapter_class=>@ccc}
+    c.opts.values_at(:adapter, :database, :host, :adapter_class).should == [:ccc, 'mydb', 'localhost', @ccc]
   end
   
   specify "should be accessible through Sequel.connect with options" do
@@ -1292,7 +1372,7 @@ describe "Database#fetch" do
     ds.select_sql.should == 'select * from xyz'
     ds.sql.should == 'select * from xyz'
     
-    ds.filter!(:price.sql_number < 100)
+    ds.filter!{price.sql_number < 100}
     ds.select_sql.should == 'select * from xyz'
     ds.sql.should == 'select * from xyz'
   end
@@ -1322,6 +1402,14 @@ describe "Database#inspect" do
   specify "should include the class name and the connection url" do
     Sequel.connect('mock://foo/bar').inspect.should == '#<Sequel::Mock::Database: "mock://foo/bar">'
   end
+
+  specify "should include the class name and the connection options if an options hash was given" do
+    Sequel.connect(:adapter=>:mock).inspect.should =~ /#<Sequel::Mock::Database: \{:adapter=>:mock\}>/
+  end
+
+  specify "should include the class name, uri, and connection options if uri and options hash was given" do
+    Sequel.connect('mock://foo', :database=>'bar').inspect.should =~ /#<Sequel::Mock::Database: "mock:\/\/foo" \{:database=>"bar"\}>/
+  end
 end
 
 describe "Database#get" do
@@ -1333,7 +1421,7 @@ describe "Database#get" do
     @db.get(1).should == 1
     @db.sqls.should == ['SELECT 1 LIMIT 1']
     
-    @db.get(:version.sql_function)
+    @db.get(Sequel.function(:version))
     @db.sqls.should == ['SELECT version() LIMIT 1']
   end
 
@@ -1381,6 +1469,11 @@ describe "Database#server_opts" do
   specify "should raise an error if the specific opts is not a proc or hash" do
     opts = {:host=>1, :database=>2, :servers=>{:server1=>2}}
     proc{Sequel::Database.new(opts).send(:server_opts, :server1)}.should raise_error(Sequel::Error)
+  end
+
+  specify "should return the general opts merged with given opts if given opts is a Hash" do
+    opts = {:host=>1, :database=>2}
+    Sequel::Database.new(opts).send(:server_opts, :host=>2)[:host].should == 2
   end
 end
 
@@ -1645,16 +1738,17 @@ describe "Database#typecast_value" do
   end
 
   specify "should typecast datetime values to Sequel.datetime_class with correct timezone handling" do
-    t = Time.utc(2011, 1, 2, 3, 4, 5) # UTC Time
-    t2 = Time.mktime(2011, 1, 2, 3, 4, 5) # Local Time
-    t3 = Time.utc(2011, 1, 2, 3, 4, 5) - (t - t2) # Local Time in UTC Time
-    t4 = Time.mktime(2011, 1, 2, 3, 4, 5) + (t - t2) # UTC Time in Local Time
-    dt = DateTime.civil(2011, 1, 2, 3, 4, 5)
+    t = Time.utc(2011, 1, 2, 3, 4, 5, 500000) # UTC Time
+    t2 = Time.mktime(2011, 1, 2, 3, 4, 5, 500000) # Local Time
+    t3 = Time.utc(2011, 1, 2, 3, 4, 5, 500000) - (t - t2) # Local Time in UTC Time
+    t4 = Time.mktime(2011, 1, 2, 3, 4, 5, 500000) + (t - t2) # UTC Time in Local Time
+    secs = defined?(Rational) ? Rational(11, 2) : 5.5
     r1 = defined?(Rational) ? Rational(t2.utc_offset, 86400) : t2.utc_offset/86400.0
     r2 = defined?(Rational) ? Rational((t - t2).to_i, 86400) : (t - t2).to_i/86400.0
-    dt2 = DateTime.civil(2011, 1, 2, 3, 4, 5, r1)
-    dt3 = DateTime.civil(2011, 1, 2, 3, 4, 5) - r2
-    dt4 = DateTime.civil(2011, 1, 2, 3, 4, 5, r1) + r2
+    dt = DateTime.civil(2011, 1, 2, 3, 4, secs)
+    dt2 = DateTime.civil(2011, 1, 2, 3, 4, secs, r1)
+    dt3 = DateTime.civil(2011, 1, 2, 3, 4, secs) - r2
+    dt4 = DateTime.civil(2011, 1, 2, 3, 4, secs, r1) + r2
 
     t.should == t4
     t2.should == t3
@@ -1670,25 +1764,26 @@ describe "Database#typecast_value" do
         v.offset.should == o.offset
       end
     end
+    @db.extend_datasets(Module.new{def supports_timestamp_timezones?; true; end})
     begin
       @db.typecast_value(:datetime, dt).should == t
       @db.typecast_value(:datetime, dt2).should == t2
       @db.typecast_value(:datetime, t).should == t
       @db.typecast_value(:datetime, t2).should == t2
-      @db.typecast_value(:datetime, dt.to_s).should == t
-      @db.typecast_value(:datetime, dt.strftime('%F %T')).should == t2
+      @db.typecast_value(:datetime, @db.literal(dt)[1...-1]).should == t
+      @db.typecast_value(:datetime, dt.strftime('%F %T.%N')).should == t2
       @db.typecast_value(:datetime, Date.civil(2011, 1, 2)).should == Time.mktime(2011, 1, 2, 0, 0, 0)
-      @db.typecast_value(:datetime, :year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec).should == t2
+      @db.typecast_value(:datetime, :year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec, :nanos=>500000000).should == t2
 
       Sequel.datetime_class = DateTime
       @db.typecast_value(:datetime, dt).should == dt
       @db.typecast_value(:datetime, dt2).should == dt2
       @db.typecast_value(:datetime, t).should == dt
       @db.typecast_value(:datetime, t2).should == dt2
-      @db.typecast_value(:datetime, dt.to_s).should == dt
-      @db.typecast_value(:datetime, dt.strftime('%F %T')).should == dt
+      @db.typecast_value(:datetime, @db.literal(dt)[1...-1]).should == dt
+      @db.typecast_value(:datetime, dt.strftime('%F %T.%N')).should == dt
       @db.typecast_value(:datetime, Date.civil(2011, 1, 2)).should == DateTime.civil(2011, 1, 2, 0, 0, 0)
-      @db.typecast_value(:datetime, :year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec).should == dt
+      @db.typecast_value(:datetime, :year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec, :nanos=>500000000).should == dt
 
       Sequel.application_timezone = :utc
       Sequel.typecast_timezone = :local
@@ -1697,20 +1792,20 @@ describe "Database#typecast_value" do
       check[dt2, t3]
       check[t, t]
       check[t2, t3]
-      check[dt.to_s, t]
-      check[dt.strftime('%F %T'), t3]
+      check[@db.literal(dt)[1...-1], t]
+      check[dt.strftime('%F %T.%N'), t3]
       check[Date.civil(2011, 1, 2), Time.utc(2011, 1, 2, 0, 0, 0)]
-      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec}, t3]
+      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec, :nanos=>500000000}, t3]
 
       Sequel.datetime_class = DateTime
       check[dt, dt]
       check[dt2, dt3]
       check[t, dt]
       check[t2, dt3]
-      check[dt.to_s, dt]
-      check[dt.strftime('%F %T'), dt3]
+      check[@db.literal(dt)[1...-1], dt]
+      check[dt.strftime('%F %T.%N'), dt3]
       check[Date.civil(2011, 1, 2), DateTime.civil(2011, 1, 2, 0, 0, 0)]
-      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec}, dt3]
+      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec, :nanos=>500000000}, dt3]
 
       Sequel.typecast_timezone = :utc
       Sequel.datetime_class = Time
@@ -1718,20 +1813,20 @@ describe "Database#typecast_value" do
       check[dt2, t3]
       check[t, t]
       check[t2, t3]
-      check[dt.to_s, t]
-      check[dt.strftime('%F %T'), t]
+      check[@db.literal(dt)[1...-1], t]
+      check[dt.strftime('%F %T.%N'), t]
       check[Date.civil(2011, 1, 2), Time.utc(2011, 1, 2, 0, 0, 0)]
-      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec}, t]
+      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec, :nanos=>500000000}, t]
 
       Sequel.datetime_class = DateTime
       check[dt, dt]
       check[dt2, dt3]
       check[t, dt]
       check[t2, dt3]
-      check[dt.to_s, dt]
-      check[dt.strftime('%F %T'), dt]
+      check[@db.literal(dt)[1...-1], dt]
+      check[dt.strftime('%F %T.%N'), dt]
       check[Date.civil(2011, 1, 2), DateTime.civil(2011, 1, 2, 0, 0, 0)]
-      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec}, dt]
+      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec, :nanos=>500000000}, dt]
 
       Sequel.application_timezone = :local
       Sequel.datetime_class = Time
@@ -1739,20 +1834,20 @@ describe "Database#typecast_value" do
       check[dt2, t2]
       check[t, t4]
       check[t2, t2]
-      check[dt.to_s, t4]
-      check[dt.strftime('%F %T'), t4]
+      check[@db.literal(dt)[1...-1], t4]
+      check[dt.strftime('%F %T.%N'), t4]
       check[Date.civil(2011, 1, 2), Time.local(2011, 1, 2, 0, 0, 0)]
-      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec}, t4]
+      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec, :nanos=>500000000}, t4]
 
       Sequel.datetime_class = DateTime
       check[dt, dt4]
       check[dt2, dt2]
       check[t, dt4]
       check[t2, dt2]
-      check[dt.to_s, dt4]
-      check[dt.strftime('%F %T'), dt4]
+      check[@db.literal(dt)[1...-1], dt4]
+      check[dt.strftime('%F %T.%N'), dt4]
       check[Date.civil(2011, 1, 2), DateTime.civil(2011, 1, 2, 0, 0, 0, r1)]
-      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec}, dt4]
+      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec, :nanos=>500000000}, dt4]
 
       Sequel.typecast_timezone = :local
       Sequel.datetime_class = Time
@@ -1760,20 +1855,20 @@ describe "Database#typecast_value" do
       check[dt2, t2]
       check[t, t4]
       check[t2, t2]
-      check[dt.to_s, t4]
-      check[dt.strftime('%F %T'), t2]
+      check[@db.literal(dt)[1...-1], t4]
+      check[dt.strftime('%F %T.%N'), t2]
       check[Date.civil(2011, 1, 2), Time.local(2011, 1, 2, 0, 0, 0)]
-      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec}, t2]
+      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec, :nanos=>500000000}, t2]
 
       Sequel.datetime_class = DateTime
       check[dt, dt4]
       check[dt2, dt2]
       check[t, dt4]
       check[t2, dt2]
-      check[dt.to_s, dt4]
-      check[dt.strftime('%F %T'), dt2]
+      check[@db.literal(dt)[1...-1], dt4]
+      check[dt.strftime('%F %T.%N'), dt2]
       check[Date.civil(2011, 1, 2), DateTime.civil(2011, 1, 2, 0, 0, 0, r1)]
-      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec}, dt2]
+      check[{:year=>dt.year, :month=>dt.month, :day=>dt.day, :hour=>dt.hour, :minute=>dt.min, :second=>dt.sec, :nanos=>500000000}, dt2]
 
     ensure
       Sequel.default_timezone = nil
@@ -1833,7 +1928,7 @@ describe "Database#typecast_value" do
   end
 
   specify "should typecast string values to String" do
-    [1.0, '1.0', '1.0'.to_sequel_blob].each do |i|
+    [1.0, '1.0', Sequel.blob('1.0')].each do |i|
       v = @db.typecast_value(:string, i)
       v.should be_an_instance_of(String)
       v.should == "1.0"
@@ -1904,14 +1999,40 @@ end
 describe "Database#schema_autoincrementing_primary_key?" do
   specify "should indicate whether the parsed schema row indicates a primary key" do
     m = Sequel::Database.new.method(:schema_autoincrementing_primary_key?)
-    m.call(:primary_key=>true).should == true
-    m.call(:primary_key=>false).should == false
+    m.call(:primary_key=>true, :db_type=>'integer').should == true
+    m.call(:primary_key=>true, :db_type=>'varchar(255)').should == false
+    m.call(:primary_key=>false, :db_type=>'integer').should == false
+  end
+end
+
+describe "Database#supports_transactional_ddl?" do
+  specify "should be false by default" do
+    Sequel::Database.new.supports_transactional_ddl?.should == false
+  end
+end
+
+describe "Database#global_index_namespace?" do
+  specify "should be true by default" do
+    Sequel::Database.new.global_index_namespace?.should == true
   end
 end
 
 describe "Database#supports_savepoints?" do
   specify "should be false by default" do
     Sequel::Database.new.supports_savepoints?.should == false
+  end
+end
+
+describe "Database#supports_savepoints_in_prepared_transactions?" do
+  specify "should be false by default" do
+    Sequel::Database.new.supports_savepoints_in_prepared_transactions?.should == false
+  end
+
+  specify "should be true if both savepoints and prepared transactions are supported" do
+    db = Sequel::Database.new
+    db.meta_def(:supports_savepoints?){true}
+    db.meta_def(:supports_prepared_transactions?){true}
+    db.supports_savepoints_in_prepared_transactions?.should == true
   end
 end
 
@@ -1956,15 +2077,18 @@ end
 describe "Database#column_schema_to_ruby_default" do
   specify "should handle converting many default formats" do
     db = Sequel::Database.new
-    m = db.method(:column_schema_to_ruby_default)
-    p = lambda{|d,t| m.call(d,t)}
+    p = lambda{|d,t| db.send(:column_schema_to_ruby_default, d, t)}
     p[nil, :integer].should be_nil
+    p[1, :integer].should == 1
     p['1', :integer].should == 1
     p['-1', :integer].should == -1
+    p[1.0, :float].should == 1.0
     p['1.0', :float].should == 1.0
     p['-1.0', :float].should == -1.0
     p['1.0', :decimal].should == BigDecimal.new('1.0')
     p['-1.0', :decimal].should == BigDecimal.new('-1.0')
+    p[true, :boolean].should == true
+    p[false, :boolean].should == false
     p['1', :boolean].should == true
     p['0', :boolean].should == false
     p['true', :boolean].should == true
@@ -1972,33 +2096,40 @@ describe "Database#column_schema_to_ruby_default" do
     p["'t'", :boolean].should == true
     p["'f'", :boolean].should == false
     p["'a'", :string].should == 'a'
-    p["'a'", :blob].should == 'a'.to_sequel_blob
+    p["'a'", :blob].should == Sequel.blob('a')
     p["'a'", :blob].should be_a_kind_of(Sequel::SQL::Blob)
     p["''", :string].should == ''
     p["'\\a''b'", :string].should == "\\a'b"
     p["'NULL'", :string].should == "NULL"
+    p[Date.today, :date].should == Date.today
     p["'2009-10-29'", :date].should == Date.new(2009,10,29)
-    p["CURRENT_TIMESTAMP", :date].should be_nil
-    p["today()", :date].should be_nil
+    p["CURRENT_TIMESTAMP", :date].should == Sequel::CURRENT_DATE
+    p["CURRENT_DATE", :date].should == Sequel::CURRENT_DATE
+    p["now()", :date].should == Sequel::CURRENT_DATE
+    p["getdate()", :date].should == Sequel::CURRENT_DATE
+    p["CURRENT_TIMESTAMP", :datetime].should == Sequel::CURRENT_TIMESTAMP
+    p["CURRENT_DATE", :datetime].should == Sequel::CURRENT_TIMESTAMP
+    p["now()", :datetime].should == Sequel::CURRENT_TIMESTAMP
+    p["getdate()", :datetime].should == Sequel::CURRENT_TIMESTAMP
     p["'2009-10-29T10:20:30-07:00'", :datetime].should == DateTime.parse('2009-10-29T10:20:30-07:00')
     p["'2009-10-29 10:20:30'", :datetime].should == DateTime.parse('2009-10-29 10:20:30')
     p["'10:20:30'", :time].should == Time.parse('10:20:30')
     p["NaN", :float].should be_nil
 
-    db.meta_def(:database_type){:postgres}
+    db = Sequel.mock(:host=>'postgres')
     p["''::text", :string].should == ""
     p["'\\a''b'::character varying", :string].should == "\\a'b"
     p["'a'::bpchar", :string].should == "a"
     p["(-1)", :integer].should == -1
     p["(-1.0)", :float].should == -1.0
     p['(-1.0)', :decimal].should == BigDecimal.new('-1.0')
-    p["'a'::bytea", :blob].should == 'a'.to_sequel_blob
+    p["'a'::bytea", :blob].should == Sequel.blob('a')
     p["'a'::bytea", :blob].should be_a_kind_of(Sequel::SQL::Blob)
     p["'2009-10-29'::date", :date].should == Date.new(2009,10,29)
     p["'2009-10-29 10:20:30.241343'::timestamp without time zone", :datetime].should == DateTime.parse('2009-10-29 10:20:30.241343')
     p["'10:20:30'::time without time zone", :time].should == Time.parse('10:20:30')
 
-    db.meta_def(:database_type){:mysql}
+    db = Sequel.mock(:host=>'mysql')
     p["\\a'b", :string].should == "\\a'b"
     p["a", :string].should == "a"
     p["NULL", :string].should == "NULL"
@@ -2007,14 +2138,71 @@ describe "Database#column_schema_to_ruby_default" do
     p["2009-10-29", :date].should == Date.new(2009,10,29)
     p["2009-10-29 10:20:30", :datetime].should == DateTime.parse('2009-10-29 10:20:30')
     p["10:20:30", :time].should == Time.parse('10:20:30')
-    p["CURRENT_DATE", :date].should be_nil
-    p["CURRENT_TIMESTAMP", :datetime].should be_nil
     p["a", :enum].should == "a"
+    p["a,b", :set].should == "a,b"
     
-    db.meta_def(:database_type){:mssql}
+    db = Sequel.mock(:host=>'mssql')
     p["(N'a')", :string].should == "a"
     p["((-12))", :integer].should == -12
     p["((12.1))", :float].should == 12.1
     p["((-12.1))", :decimal].should == BigDecimal.new('-12.1')
+  end
+end
+
+describe "Database extensions" do
+  before(:all) do
+    class << Sequel
+      alias _extension extension
+      def extension(*)
+      end
+    end
+  end
+  after(:all) do
+    class << Sequel
+      alias extension _extension
+    end
+  end
+  before do
+    @db = Sequel.mock
+  end
+
+  specify "should be able to register an extension with a module Database#extension extend the module" do
+    Sequel::Database.register_extension(:foo, Module.new{def a; 1; end})
+    @db.extension(:foo).a.should == 1
+  end
+
+  specify "should be able to register an extension with a block and Database#extension call the block" do
+    @db.quote_identifiers = false
+    Sequel::Database.register_extension(:foo){|db| db.quote_identifiers = true}
+    @db.extension(:foo).quote_identifiers?.should be_true
+  end
+
+  specify "should be able to register an extension with a callable and Database#extension call the callable" do
+    @db.quote_identifiers = false
+    Sequel::Database.register_extension(:foo, proc{|db| db.quote_identifiers = true})
+    @db.extension(:foo).quote_identifiers?.should be_true
+  end
+
+  specify "should be able to load multiple extensions in the same call" do
+    @db.quote_identifiers = false
+    @db.identifier_input_method = :downcase
+    Sequel::Database.register_extension(:foo, proc{|db| db.quote_identifiers = true})
+    Sequel::Database.register_extension(:bar, proc{|db| db.identifier_input_method = nil})
+    @db.extension(:foo, :bar)
+    @db.quote_identifiers?.should be_true
+    @db.identifier_input_method.should be_nil
+  end
+
+  specify "should return the receiver" do
+    Sequel::Database.register_extension(:foo, Module.new{def a; 1; end})
+    @db.extension(:foo).should equal(@db)
+  end
+
+  specify "should raise an Error if registering with both a module and a block" do
+    proc{Sequel::Database.register_extension(:foo, Module.new){}}.should raise_error(Sequel::Error)
+  end
+
+  specify "should raise an Error if attempting to load an incompatible extension" do
+    proc{@db.extension(:foo2)}.should raise_error(Sequel::Error)
   end
 end

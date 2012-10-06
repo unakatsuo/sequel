@@ -18,8 +18,15 @@ module Sequel
           (m = /\/(.*)/.match(URI.parse(uri).path)) && m[1]
         end
 
+        # Recognize the tinyint(1) column as boolean.
         def schema_column_type(db_type)
           db_type == 'tinyint(1)' ? :boolean : super
+        end
+
+        # Apply the connectiong setting SQLs for every new connection.
+        def setup_connection(conn)
+          mysql_connection_setting_sqls.each{|sql| log_yield(sql){conn.create_command(sql).execute_non_query}}
+          super
         end
       end
       
@@ -30,11 +37,12 @@ module Sequel
         APOS_RE = Dataset::APOS_RE
         DOUBLE_APOS = Dataset::DOUBLE_APOS
         
-        # Use execute_insert to execute the replace_sql.
-        def replace(*args)
-          execute_insert(replace_sql(*args))
+        # The DataObjects MySQL driver uses the number of rows actually modified in the update,
+        # instead of the number of matched by the filter.
+        def provides_accurate_rows_matched?
+          false
         end
-        
+      
         private
         
         # do_mysql sets NO_BACKSLASH_ESCAPES, so use standard SQL string escaping

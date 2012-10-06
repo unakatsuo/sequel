@@ -340,7 +340,7 @@ describe "Sequel::Plugins::ValidationHelpers" do
 
     ds1 = @c.dataset.filter([[:username, '0records']])
     ds2 = ds1.exclude(:id=>1)
-    @c.dataset.should_receive(:filter).with([[:username, '0records']]).twice.and_return(ds1)
+    @c.dataset.should_receive(:where).with([[:username, '0records']]).twice.and_return(ds1)
     ds1.should_receive(:exclude).with(:id=>1).once.and_return(ds2)
 
     @user = @c.load(:id=>1, :username => "0records", :password => "anothertest")
@@ -378,7 +378,7 @@ describe "Sequel::Plugins::ValidationHelpers" do
 
     ds1 = @c.dataset.filter([[:username, '0records'], [:password, 'anothertest']])
     ds2 = ds1.exclude(:id=>1)
-    @c.dataset.should_receive(:filter).with([[:username, '0records'], [:password, 'anothertest']]).twice.and_return(ds1)
+    @c.dataset.should_receive(:where).with([[:username, '0records'], [:password, 'anothertest']]).twice.and_return(ds1)
     ds1.should_receive(:exclude).with(:id=>1).once.and_return(ds2)
 
     @user = @c.load(:id=>1, :username => "0records", :password => "anothertest")
@@ -400,6 +400,19 @@ describe "Sequel::Plugins::ValidationHelpers" do
     @c.load(:id=>3, :username => "0records", :password => "anothertest").should be_valid
     MODEL_DB.sqls.should == ["SELECT COUNT(*) AS count FROM items WHERE ((username = '0records') AND active) LIMIT 1",
                     "SELECT COUNT(*) AS count FROM items WHERE ((username = '0records') AND active AND (id != 3)) LIMIT 1"]
+  end
+
+  it "should support validates_unique with a custom filter" do
+    @c.columns(:id, :username, :password)
+    @c.set_dataset MODEL_DB[:items]
+    @c.set_validations{validates_unique(:username, :where=>proc{|ds, obj, cols| ds.where(cols.map{|c| [Sequel.function(:lower, c), obj.send(c).downcase]})})}
+    @c.dataset._fetch = {:v=>0}
+    
+    MODEL_DB.reset
+    @c.new(:username => "0RECORDS", :password => "anothertest").should be_valid
+    @c.load(:id=>3, :username => "0RECORDS", :password => "anothertest").should be_valid
+    MODEL_DB.sqls.should == ["SELECT COUNT(*) AS count FROM items WHERE (lower(username) = '0records') LIMIT 1",
+                    "SELECT COUNT(*) AS count FROM items WHERE ((lower(username) = '0records') AND (id != 3)) LIMIT 1"]
   end
 
   it "should support :only_if_modified option for validates_unique, and not check uniqueness for existing records if values haven't changed" do

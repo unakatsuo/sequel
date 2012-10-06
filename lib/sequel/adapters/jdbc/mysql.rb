@@ -42,39 +42,27 @@ module Sequel
           end
         end
 
-        # MySQL 5.1.12 JDBC adapter requires this to be true,
+        # MySQL 5.1.12 JDBC adapter requires generated keys
         # and previous versions don't mind.
-        def requires_return_generated_keys?
-          true
+        def execute_statement_insert(stmt, sql)
+          stmt.executeUpdate(sql, JavaSQL::Statement.RETURN_GENERATED_KEYS)
         end
-      
+
+        # Return generated keys for insert statements.
+        def prepare_jdbc_statement(conn, sql, opts)
+          opts[:type] == :insert ? conn.prepareStatement(sql, JavaSQL::Statement.RETURN_GENERATED_KEYS) : super
+        end
+
         # Convert tinyint(1) type to boolean
         def schema_column_type(db_type)
           db_type == 'tinyint(1)' ? :boolean : super
         end
       
-        # By default, MySQL 'where id is null' selects the last inserted id.
-        # Turn that off unless explicitly enabled.
+        # Run the default connection setting SQL statements.
+        # Apply the connectiong setting SQLs for every new connection.
         def setup_connection(conn)
+          mysql_connection_setting_sqls.each{|sql| statement(conn){|s| log_yield(sql){s.execute(sql)}}}
           super
-          sql = "SET SQL_AUTO_IS_NULL=0"
-          statement(conn){|s| log_yield(sql){s.execute(sql)}} unless opts[:auto_is_null]
-          conn
-        end
-      end
-      
-      # Dataset class for MySQL datasets accessed via JDBC.
-      class Dataset < JDBC::Dataset
-        include Sequel::MySQL::DatasetMethods
-        
-        # Use execute_insert to execute the replace_sql.
-        def replace(*args)
-          execute_insert(replace_sql(*args))
-        end
-        
-        # MySQL on JDBC does provides an accurate number of rows matched.
-        def provides_accurate_rows_matched?
-          true
         end
       end
     end

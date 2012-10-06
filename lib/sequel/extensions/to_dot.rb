@@ -2,6 +2,10 @@
 # returns a string that can be processed by graphviz's +dot+ program in
 # order to get a visualization of the dataset.  Basically, it shows a version
 # of the dataset's abstract syntax tree.
+#
+# To load the extension:
+#
+#   Sequel.extension :to_dot
 
 module Sequel
   class ToDot
@@ -47,7 +51,7 @@ module Sequel
       @stack.push(@i)
       case e
       when LiteralString
-        dot "#{e.inspect}.lit"
+        dot "#{e.inspect}.lit" # core_sql use
       when Symbol, Numeric, String, Class, TrueClass, FalseClass, NilClass
         dot e.inspect
       when Array

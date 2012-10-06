@@ -12,7 +12,7 @@ rescue LoadError => e
     class PGconn
       unless method_defined?(:escape_string)
         if self.respond_to?(:escape)
-          # If there is no escape_string instead method, but there is an
+          # If there is no escape_string instance method, but there is an
           # escape class method, use that instead.
           def escape_string(str)
             Sequel::Postgres.force_standard_strings ? str.gsub("'", "''") : self.class.escape(str)
@@ -87,54 +87,16 @@ module Sequel
   Dataset::NON_SQL_OPTIONS << :cursor
   module Postgres
     CONVERTED_EXCEPTIONS << PGError
-    
-    TYPE_TRANSLATOR = tt = Class.new do
-      def boolean(s) s == 't' end
+
+    PG_TYPES[17] = Class.new do
       def bytea(s) ::Sequel::SQL::Blob.new(Adapter.unescape_bytea(s)) end
-      def integer(s) s.to_i end
-      def float(s) s.to_f end
-      def date(s) ::Date.new(*s.split("-").map{|x| x.to_i}) end
-    end.new
+    end.new.method(:bytea)
 
-    # Hash with type name symbols and callable values for converting PostgreSQL types.
-    # Non-builtin types that don't have fixed numbers should use this to register
-    # conversion procs.
-    PG_NAMED_TYPES = {}
-
-    # Hash with integer keys and callable values for converting PostgreSQL types.
-    PG_TYPES = {}
-    {
-      [16] => tt.method(:boolean),
-      [17] => tt.method(:bytea),
-      [20, 21, 22, 23, 26] => tt.method(:integer),
-      [700, 701] => tt.method(:float),
-      [790, 1700] => ::BigDecimal.method(:new),
-      [1083, 1266] => ::Sequel.method(:string_to_time),
-    }.each do |k,v|
-      k.each{|n| PG_TYPES[n] = v}
-    end
-    
-    class << self
-      # As an optimization, Sequel sets the date style to ISO, so that PostgreSQL provides
-      # the date in a known format that Sequel can parse faster.  This can be turned off
-      # if you require a date style other than ISO.
-      attr_reader :use_iso_date_format
-    end
-
-    # Modify the type translator for the date type depending on the value given.
-    def self.use_iso_date_format=(v)
-      PG_TYPES[1082] = v ? TYPE_TRANSLATOR.method(:date) : Sequel.method(:string_to_date)
-      @use_iso_date_format = v
-    end
-    self.use_iso_date_format = true
-    
     # PGconn subclass for connection specific methods used with the
     # pg, postgres, or postgres-pr driver.
     class Adapter < ::PGconn
-      DISCONNECT_ERROR_RE = /\Acould not receive data from server: Software caused connection abort/
+      DISCONNECT_ERROR_RE = /\Acould not receive data from server/
       
-      include Sequel::Postgres::AdapterMethods
-
       self.translate_results = false if respond_to?(:translate_results=)
       
       # Hash of prepared statements for this connection.  Keys are
@@ -142,24 +104,12 @@ module Sequel
       # are SQL strings.
       attr_reader(:prepared_statements) if SEQUEL_POSTGRES_USES_PG
       
-      # Apply connection settings for this connection.  Current sets
-      # the date style to ISO in order make Date object creation in ruby faster,
-      # if Postgres.use_iso_date_format is true.
-      def apply_connection_settings
-        super
-        if Postgres.use_iso_date_format
-          sql = "SET DateStyle = 'ISO'"
-          execute(sql)
-        end
-        @prepared_statements = {} if SEQUEL_POSTGRES_USES_PG
-      end
-
       # Raise a Sequel::DatabaseDisconnectError if a PGError is raised and
       # the connection status cannot be determined or it is not OK.
       def check_disconnect_errors
         begin
           yield
-        rescue PGError =>e
+        rescue PGError => e
           disconnect = false
           begin
             s = status
@@ -171,26 +121,28 @@ module Sequel
           disconnect ||= e.message =~ DISCONNECT_ERROR_RE
           disconnect ? raise(Sequel.convert_exception_class(e, Sequel::DatabaseDisconnectError)) : raise
         ensure
-          block if status_ok
+          block if status_ok && !disconnect
         end
       end
 
       # Execute the given SQL with this connection.  If a block is given,
       # yield the results, otherwise, return the number of changed rows.
       def execute(sql, args=nil)
-        q = check_disconnect_errors{@db.log_yield(sql, args){args ? async_exec(sql, args) : async_exec(sql)}}
+        args = args.map{|v| @db.bound_variable_arg(v, self)} if args
+        q = check_disconnect_errors{execute_query(sql, args)}
         begin
           block_given? ? yield(q) : q.cmd_tuples
         ensure
-          q.clear if q
+          q.clear if q && q.respond_to?(:clear)
         end
       end
 
       private
-      
-      # Return the requested values for the given row.
-      def single_value(r)
-        r.getvalue(0, 0) unless r.nil? || (r.ntuples == 0)
+
+      # Return the PGResult object that is returned by executing the given
+      # sql and args.
+      def execute_query(sql, args)
+        @db.log_yield(sql, args){args ? async_exec(sql, args) : async_exec(sql)}
       end
     end
     
@@ -198,35 +150,60 @@ module Sequel
     # pg, postgres, or postgres-pr driver.
     class Database < Sequel::Database
       include Sequel::Postgres::DatabaseMethods
+
+      INFINITE_TIMESTAMP_STRINGS = ['infinity'.freeze, '-infinity'.freeze].freeze
+      INFINITE_DATETIME_VALUES = ([PLUS_INFINITY, MINUS_INFINITY] + INFINITE_TIMESTAMP_STRINGS).freeze
       
       set_adapter_scheme :postgres
 
-      # A hash of conversion procs, keyed by type integer (oid) and
-      # having callable values for the conversion proc for that type.
-      attr_reader :conversion_procs
+      # Whether infinite timestamps should be converted on retrieval.  By default, no
+      # conversion is done, so an error is raised if you attempt to retrieve an infinite
+      # timestamp.  You can set this to :nil to convert to nil, :string to leave
+      # as a string, or :float to convert to an infinite float.
+      attr_accessor :convert_infinite_timestamps
       
       # Add the primary_keys and primary_key_sequences instance variables,
       # so we can get the correct return values for inserted rows.
       def initialize(*args)
         super
-        @primary_keys = {}
-        @primary_key_sequences = {}
+        @convert_infinite_timestamps = false
+        initialize_postgres_adapter
+      end
+
+      # Convert given argument so that it can be used directly by pg.  Currently, pg doesn't
+      # handle fractional seconds in Time/DateTime or blobs with "\0", and it won't ever
+      # handle Sequel::SQLTime values correctly.  Only public for use by the adapter, shouldn't
+      # be used by external code.
+      def bound_variable_arg(arg, conn)
+        case arg
+        when Sequel::SQL::Blob
+          conn.escape_bytea(arg)
+        when Sequel::SQLTime
+          literal(arg)
+        when DateTime, Time
+          literal(arg)
+        else
+          arg
+        end
       end
 
       # Connects to the database.  In addition to the standard database
       # options, using the :encoding or :charset option changes the
-      # client encoding for the connection.
+      # client encoding for the connection, :connect_timeout is a
+      # connection timeout in seconds, and :sslmode sets whether postgres's
+      # sslmode.  :connect_timeout and :ssl_mode are only supported if the pg
+      # driver is used.
       def connect(server)
         opts = server_opts(server)
         conn = if SEQUEL_POSTGRES_USES_PG
           connection_params = {
             :host => opts[:host],
             :port => opts[:port] || 5432,
-            :tty => '',
             :dbname => opts[:database],
             :user => opts[:user],
             :password => opts[:password],
-            :connect_timeout => opts[:connect_timeout] || 20
+            :connect_timeout => opts[:connect_timeout] || 20,
+            :sslmode => opts[:sslmode]
           }.delete_if { |key, value| blank_object?(value) }
           Adapter.connect(connection_params)
         else
@@ -246,40 +223,23 @@ module Sequel
             conn.async_exec("set client_encoding to '#{encoding}'")
           end
         end
-        conn.db = self
-        conn.apply_connection_settings
-        @conversion_procs ||= get_conversion_procs(conn)
+        conn.instance_variable_set(:@db, self)
+        conn.instance_variable_set(:@prepared_statements, {}) if SEQUEL_POSTGRES_USES_PG
+        connection_configuration_sqls.each{|sql| conn.execute(sql)}
         conn
       end
       
       # Execute the given SQL with the given args on an available connection.
       def execute(sql, opts={}, &block)
-        check_database_errors do
-          return execute_prepared_statement(sql, opts, &block) if Symbol === sql
-          synchronize(opts[:server]){|conn| conn.execute(sql, opts[:arguments], &block)}
-        end
+        synchronize(opts[:server]){|conn| check_database_errors{_execute(conn, sql, opts, &block)}}
       end
-      
-      # Insert the values into the table and return the primary key (if
-      # automatically generated).
-      def execute_insert(sql, opts={})
-        return execute(sql, opts) if Symbol === sql
-        check_database_errors do
-          synchronize(opts[:server]) do |conn|
-            conn.execute(sql, opts[:arguments])
-            insert_result(conn, opts[:table], opts[:values])
-          end
-        end
-      end
-      
+
       if SEQUEL_POSTGRES_USES_PG
-        # +copy_table+ uses PostgreSQL's +COPY+ SQL statement to return formatted
+        # +copy_table+ uses PostgreSQL's +COPY TO STDOUT+ SQL statement to return formatted
         # results directly to the caller.  This method is only supported if pg is the
         # underlying ruby driver.  This method should only be called if you want
-        # results returned to the client.  If you are using +COPY FROM+ or +COPY TO+
-        # with a filename, you should just use +run+ instead of this method.  This
-        # method does not currently support +COPY FROM STDIN+, but that may be supported
-        # in the future.
+        # results returned to the client.  If you are using +COPY TO+
+        # with a filename, you should just use +run+ instead of this method.
         #
         # The table argument supports the following types:
         #
@@ -335,6 +295,67 @@ module Sequel
           end 
         end
 
+        # +copy_into+ uses PostgreSQL's +COPY FROM STDIN+ SQL statement to do very fast inserts 
+        # into a table using input preformatting in either CSV or PostgreSQL text format.
+        # This method is only supported if pg is the underlying ruby driver.  This method should only be called if you want
+        # results returned to the client.  If you are using +COPY FROM+
+        # with a filename, you should just use +run+ instead of this method.
+        #
+        # The following options are respected:
+        #
+        # :columns :: The columns to insert into, with the same order as the columns in the
+        #             input data.  If this isn't given, uses all columns in the table.
+        # :data :: The data to copy to PostgreSQL, which should already be in CSV or PostgreSQL
+        #          text format.  This can be either a string, or any object that responds to
+        #          each and yields string.
+        # :format :: The format to use.  text is the default, so this should be :csv or :binary.
+        # :options :: An options SQL string to use, which should contain comma separated options.
+        # :server :: The server on which to run the query.
+        #
+        # If a block is provided and :data option is not, this will yield to the block repeatedly.
+        # The block should return a string, or nil to signal that it is finished.
+        def copy_into(table, opts={})
+          sql = "COPY #{literal(table)}"
+          if cols = opts[:columns]
+            sql << literal(Array(cols))
+          end
+          sql << " FROM STDIN"
+          if opts[:options] || opts[:format]
+            sql << " ("
+            sql << "FORMAT #{opts[:format]}" if opts[:format]
+            sql << "#{', ' if opts[:format]}#{opts[:options]}" if opts[:options]
+            sql << ')'
+          end
+          
+          data = opts[:data]
+          data = Array(data) if data.is_a?(String)
+
+          if block_given? && data
+            raise Error, "Cannot provide both a :data option and a block to copy_into"
+          elsif !block_given? && !data
+            raise Error, "Must provide either a :data option or a block to copy_into"
+          end
+
+          synchronize(opts[:server]) do |conn| 
+            conn.execute(sql)
+            begin
+              if block_given?
+                while buf = yield
+                  conn.put_copy_data(buf)
+                end
+              else
+                data.each{|buf| conn.put_copy_data(buf)}
+              end
+            rescue Exception => e
+              conn.put_copy_end("ruby exception occurred while copying data into PostgreSQL")
+              raise
+            ensure
+              conn.put_copy_end unless e
+              conn.get_result
+            end
+          end 
+        end
+
         # Listens on the given channel (or multiple channels if channel is an array), waiting for notifications.
         # After a notification is received, or the timeout has passed, stops listening to the channel. Options:
         #
@@ -361,7 +382,7 @@ module Sequel
             synchronize(opts[:server]) do |conn|
               begin
                 channels = Array(channels)
-                channels.each{|channel| conn.execute("LISTEN #{channel}")}
+                channels.each{|channel| conn.execute("LISTEN #{dataset.send(:table_ref, channel)}")}
                 opts[:after_listen].call(conn) if opts[:after_listen]
                 timeout = opts[:timeout] ? [opts[:timeout]] : []
                 if l = opts[:loop]
@@ -384,9 +405,38 @@ module Sequel
           end
         end
       end
+
+      # If convert_infinite_timestamps is true and the value is infinite, return an appropriate
+      # value based on the convert_infinite_timestamps setting.
+      def to_application_timestamp(value)
+        if c = convert_infinite_timestamps
+          case value
+          when *INFINITE_TIMESTAMP_STRINGS
+            infinite_timestamp_value(value)
+          else
+            super
+          end
+        else
+          super
+        end
+      end
         
       private
-      
+
+      # Execute the given SQL string or prepared statement on the connection object.
+      def _execute(conn, sql, opts, &block)
+        if sql.is_a?(Symbol)
+          execute_prepared_statement(conn, sql, opts, &block)
+        else
+          conn.execute(sql, opts[:arguments], &block)
+        end
+      end
+
+      # Execute the prepared statement name with the given arguments on the connection.
+      def _execute_prepared_statement(conn, ps_name, args, opts)
+        conn.exec_prepared(ps_name, args)
+      end
+
       # Convert exceptions raised from the block into DatabaseErrors.
       def check_database_errors
         begin
@@ -394,6 +444,13 @@ module Sequel
         rescue => e
           raise_error(e, :classes=>CONVERTED_EXCEPTIONS)
         end
+      end
+
+      # Set the DateStyle to ISO if configured, for faster date parsing.
+      def connection_configuration_sqls
+        sqls = super
+        sqls << "SET DateStyle = 'ISO'" if Postgres.use_iso_date_format
+        sqls
       end
 
       # Disconnect given connection
@@ -410,47 +467,68 @@ module Sequel
       # has prepared a statement with the same name and different SQL,
       # deallocate that statement first and then prepare this statement.
       # If a block is given, yield the result, otherwise, return the number
-      # of rows changed.  If the :insert option is passed, return the value
-      # of the primary key for the last inserted row.
-      def execute_prepared_statement(name, opts={})
-        ps = prepared_statements[name]
+      # of rows changed.
+      def execute_prepared_statement(conn, name, opts={}, &block)
+        ps = prepared_statement(name)
         sql = ps.prepared_sql
         ps_name = name.to_s
-        args = opts[:arguments]
-        synchronize(opts[:server]) do |conn|
-          unless conn.prepared_statements[ps_name] == sql
-            if conn.prepared_statements.include?(ps_name)
-              conn.execute("DEALLOCATE #{ps_name}") unless conn.prepared_statements[ps_name] == sql
-            end
-            conn.prepared_statements[ps_name] = sql
-            conn.check_disconnect_errors{log_yield("PREPARE #{ps_name} AS #{sql}"){conn.prepare(ps_name, sql)}}
-          end
-          q = conn.check_disconnect_errors{log_yield("EXECUTE #{ps_name}", args){conn.exec_prepared(ps_name, args)}}
-          if opts[:table] && opts[:values]
-            insert_result(conn, opts[:table], opts[:values])
-          else
-            begin
-              block_given? ? yield(q) : q.cmd_tuples
-            ensure
-              q.clear
-            end
-          end
+
+        if args = opts[:arguments]
+          args = args.map{|arg| bound_variable_arg(arg, conn)}
+        end
+
+        unless conn.prepared_statements[ps_name] == sql
+          conn.execute("DEALLOCATE #{ps_name}") if conn.prepared_statements.include?(ps_name)
+          conn.check_disconnect_errors{log_yield("PREPARE #{ps_name} AS #{sql}"){conn.prepare(ps_name, sql)}}
+          conn.prepared_statements[ps_name] = sql
+        end
+
+        log_sql = "EXECUTE #{ps_name}"
+        if ps.log_sql
+          log_sql << " ("
+          log_sql << sql
+          log_sql << ")"
+        end
+
+        q = conn.check_disconnect_errors{log_yield(log_sql, args){_execute_prepared_statement(conn, ps_name, args, opts)}}
+        begin
+          block_given? ? yield(q) : q.cmd_tuples
+        ensure
+          q.clear if q && q.respond_to?(:clear)
         end
       end
 
-      # Return the conversion procs hash to use for this database
-      def get_conversion_procs(conn)
-        procs = PG_TYPES.dup
-        procs[1114] = method(:to_application_timestamp)
-        procs[1184] = method(:to_application_timestamp)
-        conn.execute("SELECT oid, typname FROM pg_type where typtype = 'b'") do |res|
-          res.ntuples.times do |recnum|
-            if pr = PG_NAMED_TYPES[res.getvalue(recnum, 1).untaint.to_sym]
-              procs[res.getvalue(recnum, 0).to_i] ||= pr
-            end
-          end
+      # Return an appropriate value for the given infinite timestamp string.
+      def infinite_timestamp_value(value)
+        case convert_infinite_timestamps
+        when :nil
+          nil
+        when :string
+          value
+        else
+          value == 'infinity' ? PLUS_INFINITY : MINUS_INFINITY
         end
-        procs
+      end
+      
+      # Don't log, since logging is done by the underlying connection.
+      def log_connection_execute(conn, sql)
+        conn.execute(sql)
+      end
+
+      # If the value is an infinite value (either an infinite float or a string returned by
+      # by PostgreSQL for an infinite timestamp), return it without converting it if
+      # convert_infinite_timestamps is set.
+      def typecast_value_datetime(value)
+        if convert_infinite_timestamps
+          case value
+          when *INFINITE_DATETIME_VALUES
+            value
+          else
+            super
+          end
+        else
+          super
+        end
       end
     end
     
@@ -460,12 +538,13 @@ module Sequel
       include Sequel::Postgres::DatasetMethods
 
       Database::DatasetClass = self
+      APOS = Sequel::Dataset::APOS
       
       # Yield all rows returned by executing the given SQL and converting
       # the types.
-      def fetch_rows(sql, &block)
-        return cursor_fetch_rows(sql, &block) if @opts[:cursor]
-        execute(sql){|res| yield_hash_rows(res, fetch_rows_set_cols(res), &block)}
+      def fetch_rows(sql)
+        return cursor_fetch_rows(sql){|h| yield h} if @opts[:cursor]
+        execute(sql){|res| yield_hash_rows(res, fetch_rows_set_cols(res)){|h| yield h}}
       end
       
       # Uses a cursor for fetching records, instead of fetching the entire result
@@ -544,11 +623,6 @@ module Sequel
           def execute_dui(sql, opts={}, &block)
             super(sql, {:arguments=>bind_arguments}.merge(opts), &block)
           end
-          
-          # Same as execute, explicit due to intricacies of alias and super.
-          def execute_insert(sql, opts={}, &block)
-            super(sql, {:arguments=>bind_arguments}.merge(opts), &block)
-          end
         end
         
         # Allow use of server side prepared statements for PostgreSQL using the
@@ -574,11 +648,6 @@ module Sequel
           def execute_dui(sql, opts={}, &block)
             super(prepared_statement_name, opts, &block)
           end
-          
-          # Same as execute, explicit due to intricacies of alias and super.
-          def execute_insert(sql, opts={}, &block)
-            super(prepared_statement_name, opts, &block)
-          end
         end
         
         # Execute the given type of statement with the hash of values.
@@ -595,7 +664,7 @@ module Sequel
           ps.extend(PreparedStatementMethods)
           if name
             ps.prepared_statement_name = name
-            db.prepared_statements[name] = ps
+            db.set_prepared_statement(name, ps)
           end
           ps
         end
@@ -612,7 +681,7 @@ module Sequel
       private
       
       # Use a cursor to fetch groups of records at a time, yielding them to the block.
-      def cursor_fetch_rows(sql, &block)
+      def cursor_fetch_rows(sql)
         server_opts = {:server=>@opts[:server] || :read_only}
         db.transaction(server_opts) do 
           begin
@@ -624,12 +693,12 @@ module Sequel
             # Load columns only in the first fetch, so subsequent fetches are faster
             execute(fetch_sql) do |res|
               cols = fetch_rows_set_cols(res)
-              yield_hash_rows(res, cols, &block)
+              yield_hash_rows(res, cols){|h| yield h}
               return if res.ntuples < rows_per_fetch
             end
             loop do
               execute(fetch_sql) do |res|
-                yield_hash_rows(res, cols, &block)
+                yield_hash_rows(res, cols){|h| yield h}
                 return if res.ntuples < rows_per_fetch
               end
             end
@@ -653,12 +722,12 @@ module Sequel
       
       # Use the driver's escape_bytea
       def literal_blob_append(sql, v)
-        sql << "'" << db.synchronize{|c| c.escape_bytea(v)} << "'"
+        sql << APOS << db.synchronize{|c| c.escape_bytea(v)} << APOS
       end
       
       # Use the driver's escape_string
       def literal_string_append(sql, v)
-        sql << "'" << db.synchronize{|c| c.escape_string(v)} << "'"
+        sql << APOS << db.synchronize{|c| c.escape_string(v)} << APOS
       end
       
       # For each row in the result set, yield a hash with column name symbol

@@ -7,6 +7,7 @@ VERS = lambda do
   Sequel.version
 end
 CLEAN.include ["**/.*.sw?", "sequel-*.gem", ".config", "rdoc", "coverage", "www/public/*.html", "www/public/rdoc*", '**/*.rbc']
+SUDO = ENV['SUDO'] || 'sudo'
 
 # Gem Packaging and Release
 
@@ -18,17 +19,17 @@ end
 
 desc "Install sequel gem"
 task :install=>[:package] do
-  sh %{sudo gem install ./#{NAME}-#{VERS.call} --local}
+  sh %{#{SUDO} gem install ./#{NAME}-#{VERS.call} --local}
 end
 
 desc "Uninstall sequel gem"
 task :uninstall=>[:clean] do
-  sh %{sudo gem uninstall #{NAME}}
+  sh %{#{SUDO} gem uninstall #{NAME}}
 end
 
 desc "Upload sequel gem to gemcutter"
 task :release=>[:package] do
-  sh %{gem push ./#{NAME}-#{VERS.call}.gem} 
+  sh %{gem push ./#{NAME}-#{VERS.call}.gem}
 end
 
 ### RDoc
@@ -117,22 +118,45 @@ begin
     end
   end
 
-  spec_with_cov = lambda do |name, files, d|
+  spec_with_cov = lambda do |name, files, d, &b|
     spec.call(name, files, d)
     t = spec.call("#{name}_cov", files, "#{d} with coverage")
     t.rcov = true
     t.rcov_opts = File.read("spec/rcov.opts").split("\n")
+    b.call(t) if b
+    t
   end
-  
+
   task :default => [:spec]
-  spec_with_cov.call("spec", Dir["spec/{core,model}/*_spec.rb"], "Run core and model specs")
+  spec_with_cov.call("spec", Dir["spec/{core,model}/*_spec.rb"], "Run core and model specs"){|t| t.rcov_opts.concat(%w'--exclude "lib/sequel/(adapters/([a-ln-z]|m[a-np-z])|extensions/core_extensions)"')}
   spec.call("spec_core", Dir["spec/core/*_spec.rb"], "Run core specs")
   spec.call("spec_model", Dir["spec/model/*_spec.rb"], "Run model specs")
-  spec_with_cov.call("spec_plugin", Dir["spec/extensions/*_spec.rb"], "Run extension/plugin specs")
+  spec.call("_spec_model_no_assoc", Dir["spec/model/*_spec.rb"].delete_if{|f| f =~ /association|eager_loading/}, '')
+  spec_with_cov.call("spec_core_ext", ["spec/core_extensions_spec.rb"], "Run core extensions specs"){|t| t.rcov_opts.concat(%w'--exclude "lib/sequel/([a-z_]+\.rb|adapters|connection_pool|database|dataset|model)"')}
+  spec_with_cov.call("spec_plugin", Dir["spec/extensions/*_spec.rb"], "Run extension/plugin specs"){|t| t.rcov_opts.concat(%w'--exclude "lib/sequel/([a-z_]+\.rb|adapters|connection_pool|database|dataset|model)"')}
   spec_with_cov.call("spec_integration", Dir["spec/integration/*_test.rb"], "Run integration tests")
-  
+
   %w'postgres sqlite mysql informix oracle firebird mssql db2'.each do |adapter|
-    spec_with_cov.call("spec_#{adapter}", ["spec/adapters/#{adapter}_spec.rb"] + Dir["spec/integration/*_test.rb"], "Run #{adapter} specs")
+    spec_with_cov.call("spec_#{adapter}", ["spec/adapters/#{adapter}_spec.rb"] + Dir["spec/integration/*_test.rb"], "Run #{adapter} specs"){|t| t.rcov_opts.concat(%w'--exclude "lib/sequel/([a-z_]+\.rb|connection_pool|database|dataset|model|extensions|plugins)"')}
+  end
+
+  task :spec_travis=>[:spec, :spec_plugin, :spec_core_ext, :spec_sqlite] do
+    if defined?(RUBY_ENGINE) && RUBY_ENGINE == 'jruby'
+      ENV['SEQUEL_PG_SPEC_DB'] = "jdbc:postgresql://localhost/sequel_test?user=postgres"
+      ENV['SEQUEL_MY_SPEC_DB'] = "jdbc:mysql://localhost/sequel_test?user=root"
+    else
+      ENV['SEQUEL_PG_SPEC_DB'] = "postgres://localhost/sequel_test?user=postgres"
+      ENV['SEQUEL_MY_SPEC_DB'] = "mysql2://localhost/sequel_test?user=root"
+    end
+
+    Rake::Task['spec_postgres'].invoke
+    Rake::Task['spec_mysql'].invoke
+  end
+
+  desc "Run model specs without the associations code"
+  task :spec_model_no_assoc do
+    ENV['SEQUEL_NO_ASSOCIATIONS'] = '1'
+    Rake::Task['_spec_model_no_assoc'].invoke
   end
 rescue LoadError
   task :default do
@@ -150,7 +174,7 @@ end
 desc "Report code statistics (KLOCs, etc) from the application"
 task :stats do
   STATS_DIRECTORIES = [%w(Code lib/), %w(Spec spec)].map{|name, dir| [ name, "./#{dir}" ] }.select { |name, dir| File.directory?(dir)}
-  require "extra/stats"
+  require "./extra/stats"
   verbose = true
   CodeStatistics.new(*STATS_DIRECTORIES).to_s
 end

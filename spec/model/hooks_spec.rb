@@ -140,6 +140,12 @@ describe "Model#before_save && Model#after_save" do
     @c.load(:id => 2233).save.should == nil
     MODEL_DB.sqls.should == []
   end
+
+  specify "#save should have a raised exception reference the model instance" do
+    @c.send(:define_method, :before_save){false}
+    proc{@c.create(:x => 2233)}.should raise_error(Sequel::HookFailed){|e| e.model.should == @c.load(:x=>2233)}
+    MODEL_DB.sqls.should == []
+  end
 end
 
 describe "Model#before_destroy && Model#after_destroy" do
@@ -156,7 +162,7 @@ describe "Model#before_destroy && Model#after_destroy" do
     @c.send(:define_method, :before_destroy){MODEL_DB << "BLAH before"}
     m = @c.load(:id => 2233)
     m.destroy
-    MODEL_DB.sqls.should == ['BLAH before', 'DELETE FROM items WHERE (id = 2233)', 'BLAH after']
+    MODEL_DB.sqls.should == ['BLAH before', 'DELETE FROM items WHERE id = 2233', 'BLAH after']
   end
 
   specify "#destroy should cancel the destroy and raise an error if before_destroy returns false and raise_on_save_failure is true" do
@@ -274,7 +280,7 @@ describe "Model around filters" do
       end
     end
     @c.load(:id=>1, :x => 2).destroy
-    MODEL_DB.sqls.should == ['ad_before', 'DELETE FROM items WHERE (id = 1)', 'ad_after']
+    MODEL_DB.sqls.should == ['ad_before', 'DELETE FROM items WHERE id = 1', 'ad_after']
   end
   
   specify "around_update should be called around updating existing records" do
@@ -509,5 +515,45 @@ describe "Model#after_commit and #after_rollback" do
       @o.destroy
     end
     @db.sqls.should == ['BEGIN -- test', 'BEGIN', 'ad', 'ROLLBACK', 'adr', 'COMMIT -- test']
+  end
+
+  specify "should not call after_commit if use_after_commit_rollback is false" do
+    @o.use_after_commit_rollback = false
+    @o.save
+    @db.sqls.should == ['BEGIN', 'as', 'COMMIT']
+  end
+
+  specify "should not call after_rollback if use_after_commit_rollback is false" do
+    @o.use_after_commit_rollback = false
+    @o.rb = true
+    @o.save
+    @db.sqls.should == ['BEGIN', 'as', 'ROLLBACK']
+  end
+
+  specify "should not call after_destroy_commit if use_after_commit_rollback is false" do
+    @o.use_after_commit_rollback = false
+    @o.destroy
+    @db.sqls.should == ['BEGIN', 'ad', 'COMMIT']
+  end
+
+  specify "should not call after_destroy_rollback for save if use_after_commit_rollback is false" do
+    @o.use_after_commit_rollback = false
+    @o.rb = true
+    @o.destroy
+    @db.sqls.should == ['BEGIN', 'ad', 'ROLLBACK']
+  end
+
+  specify "should handle use_after_commit_rollback at the class level" do
+    @m.use_after_commit_rollback = false
+    @o.save
+    @db.sqls.should == ['BEGIN', 'as', 'COMMIT']
+  end
+
+  specify "should handle use_after_commit_rollback when subclassing" do
+    @m.use_after_commit_rollback = false
+    o = Class.new(@m).load({})
+    @db.sqls
+    o.save
+    @db.sqls.should == ['BEGIN', 'as', 'COMMIT']
   end
 end

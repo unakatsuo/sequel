@@ -8,7 +8,26 @@ module Sequel
       module DatabaseMethods
         include Sequel::SQLite::DatabaseMethods
         LAST_INSERT_ROWID = 'SELECT last_insert_rowid()'.freeze
+        FOREIGN_KEY_ERROR_RE = /query does not return ResultSet/.freeze
         
+        # Swallow pointless exceptions when the foreign key list pragma
+        # doesn't return any rows.
+        def foreign_key_list(table, opts={})
+          super
+        rescue Sequel::DatabaseError => e
+          raise unless e.message =~ FOREIGN_KEY_ERROR_RE
+          []
+        end
+
+        # Swallow pointless exceptions when the index list pragma
+        # doesn't return any rows.
+        def indexes(table, opts={})
+          super
+        rescue Sequel::DatabaseError => e
+          raise unless e.message =~ FOREIGN_KEY_ERROR_RE
+          {}
+        end
+
         private
         
         # Use last_insert_rowid() to get the last inserted id.
@@ -34,11 +53,6 @@ module Sequel
           end
           conn
         end
-      end
-      
-      # Dataset class for SQLite datasets accessed via JDBC.
-      class Dataset < JDBC::Dataset
-        include Sequel::SQLite::DatasetMethods
       end
     end
   end

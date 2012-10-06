@@ -1,6 +1,10 @@
 # The query extension adds Sequel::Dataset#query which allows
 # a different way to construct queries instead of the usual
 # method chaining.
+#
+# To load the extension, do:
+#
+#   Sequel.extension :query
 
 module Sequel
   class Database
@@ -16,13 +20,13 @@ module Sequel
     #
     #   dataset = DB[:items].query do
     #     select :x, :y, :z
-    #     filter{|o| (o.x > 1) & (o.y > 2)}
-    #     order :z.desc
+    #     filter{(x > 1) & (y > 2)}
+    #     reverse :z
     #   end
     #
     # Which is the same as:
     #
-    #  dataset = DB[:items].select(:x, :y, :z).filter{|o| (o.x > 1) & (o.y > 2)}.order(:z.desc)
+    #  dataset = DB[:items].select(:x, :y, :z).filter{(x > 1) & (y > 2)}.reverse(:z)
     #
     # Note that inside a call to query, you cannot call each, insert, update,
     # or delete (or any method that calls those), or Sequel will raise an
@@ -43,7 +47,7 @@ module Sequel
 
       # Merge the given options into the receiver's options and return the receiver
       # instead of cloning the receiver.
-      def clone(opts = nil)
+      def clone(opts = {})
         @opts.merge!(opts)
         self
       end

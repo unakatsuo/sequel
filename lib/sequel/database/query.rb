@@ -21,10 +21,10 @@ module Sequel
       :repeatable=>'REPEATABLE READ'.freeze,
       :serializable=>'SERIALIZABLE'.freeze}
     
-    POSTGRES_DEFAULT_RE = /\A(?:B?('.*')::[^']+|\((-?\d+(?:\.\d+)?)\))\z/
-    MSSQL_DEFAULT_RE = /\A(?:\(N?('.*')\)|\(\((-?\d+(?:\.\d+)?)\)\))\z/
-    MYSQL_TIMESTAMP_RE = /\ACURRENT_(?:DATE|TIMESTAMP)?\z/
     STRING_DEFAULT_RE = /\A'(.*)'\z/
+    CURRENT_TIMESTAMP_RE = /now|CURRENT|getdate|\ADate\(\)\z/io
+    COLUMN_SCHEMA_DATETIME_TYPES = [:date, :datetime]
+    COLUMN_SCHEMA_STRING_TYPES = [:string, :blob, :date, :datetime, :time, :enum, :set, :interval]
 
     # The prepared statement object hash for this database, keyed by name symbol
     attr_reader :prepared_statements
@@ -35,11 +35,16 @@ module Sequel
     # Database#transaction, as on MSSQL if affects all future transactions
     # on the same connection.
     attr_accessor :transaction_isolation_level
+
+    # Whether the schema should be cached for this database.  True by default
+    # for performance, can be set to false to always issue a database query to
+    # get the schema.
+    attr_accessor :cache_schema
     
     # Runs the supplied SQL statement string on the database server.
     # Returns self so it can be safely chained:
     #
-    #   DB << "UPADTE albums SET artist_id = NULL" << "DROP TABLE artists"
+    #   DB << "UPDATE albums SET artist_id = NULL" << "DROP TABLE artists"
     def <<(sql)
       run(sql)
       self
@@ -50,8 +55,8 @@ module Sequel
     #
     #   DB[:items].filter(:id=>1).prepare(:first, :sa)
     #   DB.call(:sa) # SELECT * FROM items WHERE id = 1
-    def call(ps_name, hash={})
-      prepared_statements[ps_name].call(hash)
+    def call(ps_name, hash={}, &block)
+      prepared_statement(ps_name).call(hash, &block)
     end
     
     # Executes the given SQL on the database. This method should be overridden in descendants.
@@ -81,6 +86,24 @@ module Sequel
       execute_dui(sql, opts, &block)
     end
 
+    # Returns an array of hashes containing foreign key information from the
+    # table.  Each hash will contain at least the following fields:
+    #
+    # :columns :: An array of columns in the given table
+    # :table :: The table referenced by the columns
+    # :key :: An array of columns referenced (in the table specified by :table),
+    #         but can be nil on certain adapters if the primary key is referenced.
+    #
+    # The hash may also contain entries for:
+    #
+    # :deferrable :: Whether the constraint is deferrable
+    # :name :: The name of the constraint
+    # :on_delete :: The action to take ON DELETE
+    # :on_update :: The action to take ON UPDATE
+    def foreign_key_list(table, opts={})
+      raise NotImplemented, "#foreign_key_list should be overridden by adapters"
+    end
+    
     # Returns a single value from the database, e.g.:
     #
     #   DB.get(1) # SELECT 1
@@ -171,29 +194,35 @@ module Sequel
       end
       opts[:schema] = sch if sch && !opts.include?(:schema)
 
-      @schemas.delete(quoted_name) if opts[:reload]
-      return @schemas[quoted_name] if @schemas[quoted_name]
+      Sequel.synchronize{@schemas.delete(quoted_name)} if opts[:reload]
+      if v = Sequel.synchronize{@schemas[quoted_name]}
+        return v
+      end
 
       cols = schema_parse_table(table_name, opts)
       raise(Error, 'schema parsing returned no columns, table probably doesn\'t exist') if cols.nil? || cols.empty?
       cols.each{|_,c| c[:ruby_default] = column_schema_to_ruby_default(c[:default], c[:type])}
-      @schemas[quoted_name] = cols
+      Sequel.synchronize{@schemas[quoted_name] = cols} if cache_schema
+      cols
     end
 
     # Returns true if a table with the given name exists.  This requires a query
     # to the database.
     #
     #   DB.table_exists?(:foo) # => false
-    #   # SELECT * FROM foo LIMIT 1
+    #   # SELECT NULL FROM foo LIMIT 1
+    #
+    # Note that since this does a SELECT from the table, it can give false negatives
+    # if you don't have permission to SELECT from the table.
     def table_exists?(name)
       sch, table_name = schema_and_table(name)
       name = SQL::QualifiedIdentifier.new(sch, table_name) if sch
-      from(name).first
+      _table_exists?(from(name))
       true
-    rescue
+    rescue DatabaseError
       false
     end
-    
+
     # Return all tables in the database as an array of symbols.
     #
     #   DB.tables # => [:albums, :artists]
@@ -205,8 +234,16 @@ module Sequel
     # either all statements are successful or none of the statements are
     # successful.  Note that MySQL MyISAM tabels do not support transactions.
     #
-    # The following options are respected:
+    # The following general options are respected:
     #
+    # :disconnect :: Can be set to :retry to automatically retry the transaction with
+    #                a new connection object if it detects a disconnect on the connection.
+    #                Note that this should not be used unless the entire transaction
+    #                block is idempotent, as otherwise it can cause non-idempotent
+    #                behavior to execute multiple times.  This does no checking for
+    #                infinite loops, so if your transaction will repeatedly raise a
+    #                disconnection error, this will cause the transaction block to loop
+    #                indefinitely.
     # :isolation :: The transaction isolation level to use for this transaction,
     #               should be :uncommitted, :committed, :repeatable, or :serializable,
     #               used if given and the database/adapter supports customizable
@@ -222,10 +259,31 @@ module Sequel
     #               only respected if the database/adapter supports savepoints.  By
     #               default Sequel will reuse an existing transaction, so if you want to
     #               use a savepoint you must use this option.
+    #
+    # PostgreSQL specific options:
+    #
+    # :deferrable :: (9.1+) If present, set to DEFERRABLE if true or NOT DEFERRABLE if false.
+    # :read_only :: If present, set to READ ONLY if true or READ WRITE if false.
+    # :synchronous :: if non-nil, set synchronous_commit
+    #                 appropriately.  Valid values true, :on, false, :off, :local (9.1+),
+    #                 and :remote_write (9.2+).
     def transaction(opts={}, &block)
-      synchronize(opts[:server]) do |conn|
-        return yield(conn) if already_in_transaction?(conn, opts)
-        _transaction(conn, opts, &block)
+      if opts[:disconnect] == :retry
+        begin
+          transaction(opts.merge(:disconnect=>:disallow), &block)
+        rescue Sequel::DatabaseDisconnectError
+          retry
+        end
+      else
+        synchronize(opts[:server]) do |conn|
+          if already_in_transaction?(conn, opts)
+            if opts[:disconnect] == :disallow
+              raise Sequel::Error, "cannot set :disconnect=>:retry if you are already inside a transaction"
+            end
+            return yield(conn)
+          end
+          _transaction(conn, opts, &block)
+        end
       end
     end
     
@@ -237,6 +295,12 @@ module Sequel
     end
     
     private
+    
+    # Should raise an error if the table doesn't not exist,
+    # and not raise an error if the table does exist.
+    def _table_exists?(ds)
+      ds.get(Sequel::NULL)
+    end
     
     # Internal generic transaction method.  Any exception raised by the given
     # block will cause the transaction to be rolled back.  If the exception is
@@ -259,7 +323,11 @@ module Sequel
           yield(conn)
         end
       rescue Exception => e
-        rollback_transaction(conn, opts)
+        begin
+          rollback_transaction(conn, opts)
+        rescue Exception => e3
+          raise_error(e3, :classes=>database_error_classes, :conn=>conn)
+        end
         transaction_error(e, :conn=>conn, :rollback=>rollback)
       ensure
         begin
@@ -272,36 +340,46 @@ module Sequel
       end
     end
 
+    # Synchronize access to the current transactions, returning the hash
+    # of options for the current transaction (if any)
+    def _trans(conn)
+      Sequel.synchronize{@transactions[conn]}
+    end
+
     # Add the current thread to the list of active transactions
     def add_transaction(conn, opts)
       if supports_savepoints?
-        unless @transactions[conn]
-          @transactions[conn] = {:savepoint_level=>0}
-          @transactions[conn][:prepare] = opts[:prepare] if supports_prepared_transactions?
+        unless _trans(conn)
+          if (prep = opts[:prepare]) && supports_prepared_transactions?
+            Sequel.synchronize{@transactions[conn] = {:savepoint_level=>0, :prepare=>prep}}
+          else
+            Sequel.synchronize{@transactions[conn] = {:savepoint_level=>0}}
+          end
         end
+      elsif (prep = opts[:prepare]) && supports_prepared_transactions?
+        Sequel.synchronize{@transactions[conn] = {:prepare => prep}}
       else
-        @transactions[conn] = {}
-        @transactions[conn][:prepare] = opts[:prepare] if supports_prepared_transactions?
+        Sequel.synchronize{@transactions[conn] = {}}
       end
     end    
 
     # Call all stored after_commit blocks for the given transaction
     def after_transaction_commit(conn)
-      if ary = @transactions[conn][:after_commit]
+      if ary = _trans(conn)[:after_commit]
         ary.each{|b| b.call}
       end
     end
 
     # Call all stored after_rollback blocks for the given transaction
     def after_transaction_rollback(conn)
-      if ary = @transactions[conn][:after_rollback]
+      if ary = _trans(conn)[:after_rollback]
         ary.each{|b| b.call}
       end
     end
 
     # Whether the current thread/connection is already inside a transaction
     def already_in_transaction?(conn, opts)
-      @transactions.has_key?(conn) && (!supports_savepoints? || !opts[:savepoint])
+      _trans(conn) && (!supports_savepoints? || !opts[:savepoint])
     end
     
     # SQL to start a new savepoint
@@ -318,7 +396,7 @@ module Sequel
     # Start a new database transaction or a new savepoint on the given connection.
     def begin_transaction(conn, opts={})
       if supports_savepoints?
-        th = @transactions[conn]
+        th = _trans(conn)
         if (depth = th[:savepoint_level]) > 0
           log_connection_execute(conn, begin_savepoint_sql(depth))
         else
@@ -335,56 +413,70 @@ module Sequel
       SQL_BEGIN
     end
 
-    # Convert the given default, which should be a database specific string, into
-    # a ruby object.
-    def column_schema_to_ruby_default(default, type)
-      return if default.nil?
-      orig_default = default
-      if database_type == :postgres and m = POSTGRES_DEFAULT_RE.match(default)
-        default = m[1] || m[2]
-      end
-      if database_type == :mssql and m = MSSQL_DEFAULT_RE.match(default)
-        default = m[1] || m[2]
-      end
-      if [:string, :blob, :date, :datetime, :time, :enum].include?(type)
-        if database_type == :mysql
-          return if [:date, :datetime, :time].include?(type) && MYSQL_TIMESTAMP_RE.match(default)
-          orig_default = default = "'#{default.gsub("'", "''").gsub('\\', '\\\\')}'"
+    # Whether the type should be treated as a string type when parsing the
+    # column schema default value.
+    def column_schema_default_string_type?(type)
+      COLUMN_SCHEMA_STRING_TYPES.include?(type)
+    end
+
+    # Transform the given normalized default string into a ruby object for the
+    # given type.
+    def column_schema_default_to_ruby_value(default, type)
+      case type
+      when :boolean
+        case default 
+        when /[f0]/i
+          false
+        when /[t1]/i
+          true
         end
-        return unless m = STRING_DEFAULT_RE.match(default)
-        default = m[1].gsub("''", "'")
-      end
-      res = begin
-        case type
-        when :boolean
-          case default 
-          when /[f0]/i
-            false
-          when /[t1]/i
-            true
-          end
-        when :string, :enum
-          default
-        when :blob
-          Sequel::SQL::Blob.new(default)
-        when :integer
-          Integer(default)
-        when :float
-          Float(default)
-        when :date
-          Sequel.string_to_date(default)
-        when :datetime
-          DateTime.parse(default)
-        when :time
-          Sequel.string_to_time(default)
-        when :decimal
-          BigDecimal.new(default)
-        end
-      rescue
-        nil
+      when :string, :enum, :set, :interval
+        default
+      when :blob
+        Sequel::SQL::Blob.new(default)
+      when :integer
+        Integer(default)
+      when :float
+        Float(default)
+      when :date
+        Sequel.string_to_date(default)
+      when :datetime
+        DateTime.parse(default)
+      when :time
+        Sequel.string_to_time(default)
+      when :decimal
+        BigDecimal.new(default)
       end
     end
    
+    # Normalize the default value string for the given type
+    # and return the normalized value.
+    def column_schema_normalize_default(default, type)
+      if column_schema_default_string_type?(type)
+        return unless m = STRING_DEFAULT_RE.match(default)
+        m[1].gsub("''", "'")
+      else
+        default
+      end
+    end
+
+    # Convert the given default, which should be a database specific string, into
+    # a ruby object.
+    def column_schema_to_ruby_default(default, type)
+      return default unless default.is_a?(String)
+      if COLUMN_SCHEMA_DATETIME_TYPES.include?(type)
+        if CURRENT_TIMESTAMP_RE.match(default)
+          if type == :date
+            return Sequel::CURRENT_DATE
+          else
+            return Sequel::CURRENT_TIMESTAMP
+          end
+        end
+      end
+      default = column_schema_normalize_default(default, type)
+      column_schema_default_to_ruby_value(default, type) rescue nil
+    end
+
     if (! defined?(RUBY_ENGINE) or RUBY_ENGINE == 'ruby' or RUBY_ENGINE == 'rbx') and RUBY_VERSION < '1.9'
       # Whether to commit the current transaction. On ruby 1.8 and rubinius,
       # Thread.current.status is checked because Thread#kill skips rescue
@@ -425,7 +517,7 @@ module Sequel
     # Commit the active transaction on the connection
     def commit_transaction(conn, opts={})
       if supports_savepoints?
-        depth = @transactions[conn][:savepoint_level]
+        depth = _trans(conn)[:savepoint_level]
         log_connection_execute(conn, depth > 1 ? commit_savepoint_sql(depth-1) : commit_transaction_sql)
       else
         log_connection_execute(conn, commit_transaction_sql)
@@ -475,7 +567,7 @@ module Sequel
     
     # Remove the current thread from the list of active transactions
     def remove_transaction(conn, committed)
-      if !supports_savepoints? || ((@transactions[conn][:savepoint_level] -= 1) <= 0)
+      if !supports_savepoints? || ((_trans(conn)[:savepoint_level] -= 1) <= 0)
         begin
           if committed
             after_transaction_commit(conn)
@@ -483,7 +575,7 @@ module Sequel
             after_transaction_rollback(conn)
           end
         ensure
-          @transactions.delete(conn)
+          Sequel.synchronize{@transactions.delete(conn)}
         end
       end
     end
@@ -496,7 +588,7 @@ module Sequel
     # Rollback the active transaction on the connection
     def rollback_transaction(conn, opts={})
       if supports_savepoints?
-        depth = @transactions[conn][:savepoint_level]
+        depth = _trans(conn)[:savepoint_level]
         log_connection_execute(conn, depth > 1 ? rollback_savepoint_sql(depth-1) : rollback_transaction_sql)
       else
         log_connection_execute(conn, rollback_transaction_sql)
@@ -513,25 +605,23 @@ module Sequel
     # such as :integer or :string.
     def schema_column_type(db_type)
       case db_type
-      when /\Ainterval\z/io
-        :interval
-      when /\A(character( varying)?|n?(var)?char|n?text)/io
+      when /\A(character( varying)?|n?(var)?char|n?text|string|clob)/io
         :string
       when /\A(int(eger)?|(big|small|tiny)int)/io
         :integer
       when /\Adate\z/io
         :date
-      when /\A((small)?datetime|timestamp( with(out)? time zone)?)\z/io
+      when /\A((small)?datetime|timestamp( with(out)? time zone)?)(\(\d+\))?\z/io
         :datetime
       when /\Atime( with(out)? time zone)?\z/io
         :time
       when /\A(bool(ean)?)\z/io
         :boolean
-      when /\A(real|float|double( precision)?)\z/io
+      when /\A(real|float|double( precision)?|double\(\d+,\d+\)( unsigned)?)\z/io
         :float
       when /\A(?:(?:(?:num(?:ber|eric)?|decimal)(?:\(\d+,\s*(\d+|false|true)\))?)|(?:small)?money)\z/io
         $1 && ['0', 'false'].include?($1) ? :integer : :decimal
-      when /bytea|[bc]lob|image|(var)?binary/io
+      when /bytea|blob|image|(var)?binary/io
         :blob
       when /\Aenum/io
         :enum

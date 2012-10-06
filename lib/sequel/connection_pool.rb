@@ -59,6 +59,14 @@ class Sequel::ConnectionPool
     end
   end
   extend ClassMethods
+
+  # The after_connect proc used for this pool.  This is called with each new
+  # connection made, and is usually used to set custom per-connection settings.
+  attr_accessor :after_connect
+
+  # The disconnect_proc used for the pool.  This is called with each connection
+  # that is disconnected, usually to clean up related resources.
+  attr_accessor :disconnection_proc
   
   # Instantiates a connection pool with the given options.  The block is called
   # with a single symbol (specifying the server/shard to use) every time a new
@@ -82,7 +90,7 @@ class Sequel::ConnectionPool
   
   # An array of symbols for all shards/servers, which is a single <tt>:default</tt> by default.
   def servers
-    [:default]
+    [DEFAULT_SERVER]
   end
   
   private

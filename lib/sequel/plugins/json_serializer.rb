@@ -56,6 +56,30 @@ module Sequel
     #   Album.to_json
     #   Album.filter(:artist_id=>1).to_json(:include=>:tags)
     #
+    # If you have an existing array of model instances you want to convert to
+    # JSON, you can call the class to_json method with the :array option:
+    #
+    #   Album.to_json(:array=>[Album[1], Album[2]])
+    #
+    # Note that active_support/json makes incompatible changes to the to_json API,
+    # and breaks some aspects of the json_serializer plugin.  You can undo the damage
+    # done by active_support/json by doing:
+    #
+    #   class Array
+    #     def to_json(options = {})
+    #       JSON.generate(self)
+    #     end
+    #   end
+    #
+    #   class Hash
+    #     def to_json(options = {})
+    #       JSON.generate(self)
+    #     end
+    #   end
+    #
+    # Note that this will probably cause active_support/json to no longer work
+    # correctly in some cases.
+    #
     # Usage:
     #
     #   # Add JSON output capability to all model subclass instances (called before loading subclasses)
@@ -134,8 +158,13 @@ module Sequel
       module InstanceMethods
         # Parse the provided JSON, which should return a hash,
         # and call +set+ with that hash.
-        def from_json(json)
-          set(JSON.parse(json))
+        def from_json(json, opts={})
+          h = JSON.parse(json)
+          if fields = opts[:fields]
+            set_fields(h, fields, opts)
+          else
+            set(h)
+          end
         end
 
         # Return a string in JSON format.  Accepts the following
@@ -149,7 +178,7 @@ module Sequel
         #             to include in the JSON output.  Using a nested
         #             hash, you can pass options to associations
         #             to affect the JSON used for associated objects.
-        # :naked :: Not to add the JSON.create_id key to the JSON
+        # :naked :: Not to add the JSON.create_id (json_class) key to the JSON
         #           output hash, so when the JSON is parsed, it
         #           will yield a hash instead of a model object.
         # :only :: Symbol or Array of Symbols of columns to only
@@ -195,7 +224,21 @@ module Sequel
       module DatasetMethods
         # Return a JSON string representing an array of all objects in
         # this dataset.  Takes the same options as the the instance
-        # method, and passes them to every instance.
+        # method, and passes them to every instance.  Additionally,
+        # respects the following options:
+        #
+        # :array :: An array of instances.  If this is not provided,
+        #           calls #all on the receiver to get the array.
+        # :root :: If set to :collection, only wraps the collection
+        #          in a root object.  If set to :instance, only wraps
+        #          the instances in a root object.  If set to :both,
+        #          wraps both the collection and instances in a root
+        #          object.  Unfortunately, for backwards compatibility,
+        #          if this option is true and doesn't match one of those
+        #          symbols, it defaults to both.  That may change in a
+        #          future version, so for forwards compatibility, you
+        #          should pick a specific symbol for your desired
+        #          behavior.
         def to_json(*a)
           if opts = a.first.is_a?(Hash)
             opts = model.json_serializer_opts.merge(a.first)
@@ -203,8 +246,36 @@ module Sequel
           else
             opts = model.json_serializer_opts
           end
-          res = row_proc ? all.map{|obj| Literal.new(obj.to_json(opts))} : all
-          opts[:root] ? {model.send(:pluralize, model.send(:underscore, model.to_s)) => res}.to_json(*a) : res.to_json(*a)
+
+          collection_root = case opts[:root]
+          when nil, false, :instance
+            false
+          when :collection
+            opts = opts.dup
+            opts.delete(:root)
+            opts[:naked] = true unless opts.has_key?(:naked)
+            true
+          else
+            true
+          end
+
+          res = if row_proc 
+            array = if opts[:array]
+              opts = opts.dup
+              opts.delete(:array)
+            else
+              all
+            end
+            array.map{|obj| Literal.new(obj.to_json(opts))}
+           else
+            all
+          end
+
+          if collection_root
+            {model.send(:pluralize, model.send(:underscore, model.to_s)) => res}.to_json(*a)
+          else
+            res.to_json(*a)
+          end
         end
       end
     end

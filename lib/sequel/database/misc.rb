@@ -4,6 +4,28 @@ module Sequel
     # :section: 7 - Miscellaneous methods
     # These methods don't fit neatly into another category.
     # ---------------------
+    
+    # Hash of extension name symbols to callable objects to load the extension
+    # into the Database object (usually by extending it with a module defined
+    # in the extension).
+    EXTENSIONS = {}
+
+    # Register an extension callback for Database objects.  ext should be the
+    # extension name symbol, and mod should either be a Module that the
+    # database is extended with, or a callable object called with the database
+    # object.  If mod is not provided, a block can be provided and is treated
+    # as the mod object.
+    def self.register_extension(ext, mod=nil, &block)
+      if mod
+        raise(Error, "cannot provide both mod and block to Database.register_extension") if block
+        if mod.is_a?(Module)
+          block = proc{|db| db.extend(mod)}
+        else
+          block = mod
+        end
+      end
+      Sequel.synchronize{EXTENSIONS[ext] = block}
+    end
 
     # Converts a uri to an options hash. These options are then passed
     # to a newly created database object. 
@@ -26,7 +48,7 @@ module Sequel
     # options hash.
     #
     # Accepts the following options:
-    # :default_schema :: The default schema to use, should generally be nil
+    # :default_schema :: The default schema to use, see #default_schema.
     # :disconnection_proc :: A proc used to disconnect the connection
     # :identifier_input_method :: A string method symbol to call on identifiers going into the database
     # :identifier_output_method :: A string method symbol to call on identifiers coming from the database
@@ -61,11 +83,12 @@ module Sequel
       @quote_identifiers = nil
       @timezone = nil
       @dataset_class = dataset_class_default
+      @cache_schema = typecast_value_boolean(@opts.fetch(:cache_schema, true))
       @dataset_modules = []
       self.sql_log_level = @opts[:sql_log_level] ? @opts[:sql_log_level].to_sym : :info
       @pool = ConnectionPool.get_pool(@opts, &block)
 
-      ::Sequel::DATABASES.push(self)
+      Sequel.synchronize{::Sequel::DATABASES.push(self)}
     end
 
     # If a transaction is not currently in process, yield to the block immediately.
@@ -76,7 +99,7 @@ module Sequel
     def after_commit(opts={}, &block)
       raise Error, "must provide block to after_commit" unless block
       synchronize(opts[:server]) do |conn|
-        if h = @transactions[conn]
+        if h = _trans(conn)
           raise Error, "cannot call after_commit in a prepared transaction" if h[:prepare]
           (h[:after_commit] ||= []) << block
         else
@@ -93,7 +116,7 @@ module Sequel
     def after_rollback(opts={}, &block)
       raise Error, "must provide block to after_rollback" unless block
       synchronize(opts[:server]) do |conn|
-        if h = @transactions[conn]
+        if h = _trans(conn)
           raise Error, "cannot call after_rollback in a prepared transaction" if h[:prepare]
           (h[:after_rollback] ||= []) << block
         end
@@ -108,6 +131,23 @@ module Sequel
       type_literal(:type=>type)
     end
 
+    # Load an extension into the receiver.  In addition to requiring the extension file, this
+    # also modifies the database to work with the extension (usually extending it with a
+    # module defined in the extension file).  If no related extension file exists or the
+    # extension does not have specific support for Database objects, an Error will be raised.
+    # Returns self.
+    def extension(*exts)
+      Sequel.extension(*exts)
+      exts.each do |ext|
+        if pr = Sequel.synchronize{EXTENSIONS[ext]}
+          pr.call(self)
+        else
+          raise(Error, "Extension #{ext} does not have specific support handling individual databases")
+        end
+      end
+      self
+    end
+
     # Convert the given timestamp from the application's timezone,
     # to the databases's timezone or the default database timezone if
     # the database does not have a timezone.
@@ -115,18 +155,28 @@ module Sequel
       Sequel.convert_output_timestamp(v, timezone)
     end
 
+    # Whether the database uses a global namespace for the index.  If
+    # false, the indexes are going to be namespaced per table.
+    def global_index_namespace?
+      true
+    end
+
     # Return true if already in a transaction given the options,
     # false otherwise.  Respects the :server option for selecting
     # a shard.
     def in_transaction?(opts={})
-      synchronize(opts[:server]){|conn| !!@transactions[conn]}
+      synchronize(opts[:server]){|conn| !!_trans(conn)}
     end
 
     # Returns a string representation of the database object including the
-    # class name and the connection URI (or the opts if the URI
-    # cannot be constructed).
+    # class name and connection URI and options used when connecting (if any).
     def inspect
-      "#<#{self.class}: #{(uri rescue opts).inspect}>" 
+      a = []
+      a << uri.inspect if uri
+      if (oo = opts[:orig_opts]) && !oo.empty?
+        a << oo.inspect
+      end
+      "#<#{self.class}: #{a.join(' ')}>"
     end
 
     # Proxy the literal call to the dataset.
@@ -138,16 +188,32 @@ module Sequel
       schema_utility_dataset.literal(v)
     end
 
+    # Synchronize access to the prepared statements cache.
+    def prepared_statement(name)
+      Sequel.synchronize{prepared_statements[name]}
+    end
+
     # Default serial primary key options, used by the table creation
     # code.
     def serial_primary_key_options
       {:primary_key => true, :type => Integer, :auto_increment => true}
     end
 
+    # Cache the prepared statement object at the given name.
+    def set_prepared_statement(name, ps)
+      Sequel.synchronize{prepared_statements[name] = ps}
+    end
+
     # Whether the database supports CREATE TABLE IF NOT EXISTS syntax,
     # false by default.
     def supports_create_table_if_not_exists?
       false
+    end
+
+    # Whether the database supports DROP TABLE IF EXISTS syntax,
+    # default is the same as #supports_create_table_if_not_exists?.
+    def supports_drop_table_if_exists?
+      supports_create_table_if_not_exists?
     end
 
     # Whether the database and adapter support prepared transactions
@@ -161,8 +227,19 @@ module Sequel
       false
     end
 
+    # Whether the database and adapter support savepoints inside prepared transactions
+    # (two-phase commit), default is false.
+    def supports_savepoints_in_prepared_transactions?
+      supports_prepared_transactions? && supports_savepoints?
+    end
+
     # Whether the database and adapter support transaction isolation levels, false by default.
     def supports_transaction_isolation_levels?
+      false
+    end
+
+    # Whether DDL statements work correctly in transactions, false by default.
+    def supports_transactional_ddl?
       false
     end
 
@@ -193,29 +270,10 @@ module Sequel
       end
     end
     
-    # Returns the URI identifying the database, which may not be the
-    # same as the URI used when connecting.
-    # This method can raise an error if the database used options
-    # instead of a connection string, and will not include uri
-    # parameters.
-    #
-    #   Sequel.connect('postgres://localhost/db?user=billg').url
-    #   # => "postgres://billg@localhost/db"
+    # Returns the URI use to connect to the database.  If a URI
+    # was not used when connecting, returns nil.
     def uri
-      uri = URI::Generic.new(
-        adapter_scheme.to_s,
-        nil,
-        @opts[:host],
-        @opts[:port],
-        nil,
-        "/#{@opts[:database]}",
-        nil,
-        nil,
-        nil
-      )
-      uri.user = @opts[:user]
-      uri.password = @opts[:password] if uri.user
-      uri.to_s
+      opts[:uri]
     end
     
     # Explicit alias of uri for easier subclassing.
@@ -345,7 +403,8 @@ module Sequel
         if value.is_a?(SQLTime)
           value
         else
-          SQLTime.create(value.hour, value.min, value.sec, value.respond_to?(:nsec) ? value.nsec/1000.0 : value.usec)
+          # specifically check for nsec == 0 value to work around JRuby 1.6 ruby 1.9 mode bug
+          SQLTime.create(value.hour, value.min, value.sec, (value.respond_to?(:nsec) && value.nsec != 0) ? value.nsec/1000.0 : value.usec)
         end
       when String
         Sequel.string_to_time(value)

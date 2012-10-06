@@ -21,6 +21,41 @@ describe Sequel::Model, "many_through_many" do
     Object.send(:remove_const, :Tag)
   end
 
+  it "should populate :key_hash and :id_map option correctly for custom eager loaders" do
+    khs = []
+    pr = proc{|h| khs << [h[:key_hash], h[:id_map]]}
+    @c1.many_through_many :tags, :through=>[[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]], :eager_loader=>pr
+    @c1.eager(:tags).all
+    khs.should == [[{:id=>{1=>[Artist.load(:x=>1, :id=>1)]}}, {1=>[Artist.load(:x=>1, :id=>1)]}]]
+
+    khs.clear
+    @c1.many_through_many :tags, :through=>[[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]], :left_primary_key=>:id, :left_primary_key_column=>:i, :eager_loader=>pr
+    @c1.eager(:tags).all
+    khs.should == [[{:id=>{1=>[Artist.load(:x=>1, :id=>1)]}}, {1=>[Artist.load(:x=>1, :id=>1)]}]]
+  end
+
+  it "should support using a custom :left_primary_key option when eager loading many_to_many associations" do
+    @c1.send(:define_method, :id3){id*3}
+    @c1.dataset._fetch = {:id=>1}
+    @c2.dataset._fetch = {:id=>4, :x_foreign_key_x=>3}
+    @c1.many_through_many :tags, :through=>[[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]], :left_primary_key=>:id3
+    a = @c1.eager(:tags).all
+    a.should == [@c1.load(:id => 1)]
+    MODEL_DB.sqls.should == ['SELECT * FROM artists', "SELECT tags.*, albums_artists.artist_id AS x_foreign_key_x FROM tags INNER JOIN albums_tags ON (albums_tags.tag_id = tags.id) INNER JOIN albums ON (albums.id = albums_tags.album_id) INNER JOIN albums_artists ON ((albums_artists.album_id = albums.id) AND (albums_artists.artist_id IN (3)))"]
+    a.first.tags.should == [@c2.load(:id=>4)]
+    MODEL_DB.sqls.should == []
+  end
+
+  it "should handle a :eager_loading_predicate_key option to change the SQL used in the lookup" do
+    @c1.dataset._fetch = {:id=>1}
+    @c2.dataset._fetch = {:id=>4, :x_foreign_key_x=>1}
+    @c1.many_through_many :tags, :through=>[[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]], :eager_loading_predicate_key=>Sequel./(:albums_artists__artist_id, 3)
+    a = @c1.eager(:tags).all
+    a.should == [@c1.load(:id => 1)]
+    MODEL_DB.sqls.should == ['SELECT * FROM artists', "SELECT tags.*, (albums_artists.artist_id / 3) AS x_foreign_key_x FROM tags INNER JOIN albums_tags ON (albums_tags.tag_id = tags.id) INNER JOIN albums ON (albums.id = albums_tags.album_id) INNER JOIN albums_artists ON ((albums_artists.album_id = albums.id) AND ((albums_artists.artist_id / 3) IN (1)))"]
+    a.first.tags.should == [@c2.load(:id=>4)]
+  end
+  
   it "should default to associating to other models in the same scope" do
     begin
       class ::AssociationModuleTest
@@ -101,52 +136,52 @@ describe Sequel::Model, "many_through_many" do
   
   it "should allowing filtering by many_through_many associations" do
     @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]]
-    @c1.filter(:tags=>@c2.load(:id=>1234)).sql.should == 'SELECT * FROM artists WHERE (id IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums ON (albums.id = albums_artists.album_id) INNER JOIN albums_tags ON (albums_tags.album_id = albums.id) WHERE ((albums_tags.tag_id = 1234) AND (albums_artists.artist_id IS NOT NULL))))'
+    @c1.filter(:tags=>@c2.load(:id=>1234)).sql.should == 'SELECT * FROM artists WHERE (artists.id IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums ON (albums.id = albums_artists.album_id) INNER JOIN albums_tags ON (albums_tags.album_id = albums.id) WHERE ((albums_tags.tag_id = 1234) AND (albums_artists.artist_id IS NOT NULL))))'
   end
 
   it "should allowing filtering by many_through_many associations with a single through table" do
     @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id]]
-    @c1.filter(:tags=>@c2.load(:id=>1234)).sql.should == 'SELECT * FROM artists WHERE (id IN (SELECT albums_artists.artist_id FROM albums_artists WHERE ((albums_artists.album_id = 1234) AND (albums_artists.artist_id IS NOT NULL))))'
+    @c1.filter(:tags=>@c2.load(:id=>1234)).sql.should == 'SELECT * FROM artists WHERE (artists.id IN (SELECT albums_artists.artist_id FROM albums_artists WHERE ((albums_artists.album_id = 1234) AND (albums_artists.artist_id IS NOT NULL))))'
   end
 
   it "should allowing filtering by many_through_many associations with aliased tables" do
     @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], [:albums_artists, :id, :id], [:albums_artists, :album_id, :tag_id]]
-    @c1.filter(:tags=>@c2.load(:id=>1234)).sql.should == 'SELECT * FROM artists WHERE (id IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums_artists AS albums_artists_0 ON (albums_artists_0.id = albums_artists.album_id) INNER JOIN albums_artists AS albums_artists_1 ON (albums_artists_1.album_id = albums_artists_0.id) WHERE ((albums_artists_1.tag_id = 1234) AND (albums_artists.artist_id IS NOT NULL))))'
+    @c1.filter(:tags=>@c2.load(:id=>1234)).sql.should == 'SELECT * FROM artists WHERE (artists.id IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums_artists AS albums_artists_0 ON (albums_artists_0.id = albums_artists.album_id) INNER JOIN albums_artists AS albums_artists_1 ON (albums_artists_1.album_id = albums_artists_0.id) WHERE ((albums_artists_1.tag_id = 1234) AND (albums_artists.artist_id IS NOT NULL))))'
   end
 
   it "should allowing filtering by many_through_many associations with composite keys" do
     @c1.many_through_many :tags, [[:albums_artists, [:b1, :b2], [:c1, :c2]], [:albums, [:d1, :d2], [:e1, :e2]], [:albums_tags, [:f1, :f2], [:g1, :g2]]], :right_primary_key=>[:h1, :h2], :left_primary_key=>[:id, :yyy]
-    @c1.filter(:tags=>@c2.load(:h1=>1234, :h2=>85)).sql.should == 'SELECT * FROM artists WHERE ((id, yyy) IN (SELECT albums_artists.b1, albums_artists.b2 FROM albums_artists INNER JOIN albums ON ((albums.d1 = albums_artists.c1) AND (albums.d2 = albums_artists.c2)) INNER JOIN albums_tags ON ((albums_tags.f1 = albums.e1) AND (albums_tags.f2 = albums.e2)) WHERE ((albums_tags.g1 = 1234) AND (albums_tags.g2 = 85) AND (albums_artists.b1 IS NOT NULL) AND (albums_artists.b2 IS NOT NULL))))'
+    @c1.filter(:tags=>@c2.load(:h1=>1234, :h2=>85)).sql.should == 'SELECT * FROM artists WHERE ((artists.id, artists.yyy) IN (SELECT albums_artists.b1, albums_artists.b2 FROM albums_artists INNER JOIN albums ON ((albums.d1 = albums_artists.c1) AND (albums.d2 = albums_artists.c2)) INNER JOIN albums_tags ON ((albums_tags.f1 = albums.e1) AND (albums_tags.f2 = albums.e2)) WHERE ((albums_tags.g1 = 1234) AND (albums_tags.g2 = 85) AND (albums_artists.b1 IS NOT NULL) AND (albums_artists.b2 IS NOT NULL))))'
   end
 
   it "should allowing excluding by many_through_many associations" do
     @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]]
-    @c1.exclude(:tags=>@c2.load(:id=>1234)).sql.should == 'SELECT * FROM artists WHERE ((id NOT IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums ON (albums.id = albums_artists.album_id) INNER JOIN albums_tags ON (albums_tags.album_id = albums.id) WHERE ((albums_tags.tag_id = 1234) AND (albums_artists.artist_id IS NOT NULL)))) OR (id IS NULL))'
+    @c1.exclude(:tags=>@c2.load(:id=>1234)).sql.should == 'SELECT * FROM artists WHERE ((artists.id NOT IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums ON (albums.id = albums_artists.album_id) INNER JOIN albums_tags ON (albums_tags.album_id = albums.id) WHERE ((albums_tags.tag_id = 1234) AND (albums_artists.artist_id IS NOT NULL)))) OR (artists.id IS NULL))'
   end
 
   it "should allowing excluding by many_through_many associations with composite keys" do
     @c1.many_through_many :tags, [[:albums_artists, [:b1, :b2], [:c1, :c2]], [:albums, [:d1, :d2], [:e1, :e2]], [:albums_tags, [:f1, :f2], [:g1, :g2]]], :right_primary_key=>[:h1, :h2], :left_primary_key=>[:id, :yyy]
-    @c1.exclude(:tags=>@c2.load(:h1=>1234, :h2=>85)).sql.should == 'SELECT * FROM artists WHERE (((id, yyy) NOT IN (SELECT albums_artists.b1, albums_artists.b2 FROM albums_artists INNER JOIN albums ON ((albums.d1 = albums_artists.c1) AND (albums.d2 = albums_artists.c2)) INNER JOIN albums_tags ON ((albums_tags.f1 = albums.e1) AND (albums_tags.f2 = albums.e2)) WHERE ((albums_tags.g1 = 1234) AND (albums_tags.g2 = 85) AND (albums_artists.b1 IS NOT NULL) AND (albums_artists.b2 IS NOT NULL)))) OR (id IS NULL) OR (yyy IS NULL))'
+    @c1.exclude(:tags=>@c2.load(:h1=>1234, :h2=>85)).sql.should == 'SELECT * FROM artists WHERE (((artists.id, artists.yyy) NOT IN (SELECT albums_artists.b1, albums_artists.b2 FROM albums_artists INNER JOIN albums ON ((albums.d1 = albums_artists.c1) AND (albums.d2 = albums_artists.c2)) INNER JOIN albums_tags ON ((albums_tags.f1 = albums.e1) AND (albums_tags.f2 = albums.e2)) WHERE ((albums_tags.g1 = 1234) AND (albums_tags.g2 = 85) AND (albums_artists.b1 IS NOT NULL) AND (albums_artists.b2 IS NOT NULL)))) OR (artists.id IS NULL) OR (artists.yyy IS NULL))'
   end
 
   it "should allowing filtering by multiple many_through_many associations" do
     @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]]
-    @c1.filter(:tags=>[@c2.load(:id=>1234), @c2.load(:id=>2345)]).sql.should == 'SELECT * FROM artists WHERE (id IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums ON (albums.id = albums_artists.album_id) INNER JOIN albums_tags ON (albums_tags.album_id = albums.id) WHERE ((albums_tags.tag_id IN (1234, 2345)) AND (albums_artists.artist_id IS NOT NULL))))'
+    @c1.filter(:tags=>[@c2.load(:id=>1234), @c2.load(:id=>2345)]).sql.should == 'SELECT * FROM artists WHERE (artists.id IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums ON (albums.id = albums_artists.album_id) INNER JOIN albums_tags ON (albums_tags.album_id = albums.id) WHERE ((albums_tags.tag_id IN (1234, 2345)) AND (albums_artists.artist_id IS NOT NULL))))'
   end
 
   it "should allowing filtering by multiple many_through_many associations with composite keys" do
     @c1.many_through_many :tags, [[:albums_artists, [:b1, :b2], [:c1, :c2]], [:albums, [:d1, :d2], [:e1, :e2]], [:albums_tags, [:f1, :f2], [:g1, :g2]]], :right_primary_key=>[:h1, :h2], :left_primary_key=>[:id, :yyy]
-    @c1.filter(:tags=>[@c2.load(:h1=>1234, :h2=>85), @c2.load(:h1=>2345, :h2=>95)]).sql.should == 'SELECT * FROM artists WHERE ((id, yyy) IN (SELECT albums_artists.b1, albums_artists.b2 FROM albums_artists INNER JOIN albums ON ((albums.d1 = albums_artists.c1) AND (albums.d2 = albums_artists.c2)) INNER JOIN albums_tags ON ((albums_tags.f1 = albums.e1) AND (albums_tags.f2 = albums.e2)) WHERE (((albums_tags.g1, albums_tags.g2) IN ((1234, 85), (2345, 95))) AND (albums_artists.b1 IS NOT NULL) AND (albums_artists.b2 IS NOT NULL))))'
+    @c1.filter(:tags=>[@c2.load(:h1=>1234, :h2=>85), @c2.load(:h1=>2345, :h2=>95)]).sql.should == 'SELECT * FROM artists WHERE ((artists.id, artists.yyy) IN (SELECT albums_artists.b1, albums_artists.b2 FROM albums_artists INNER JOIN albums ON ((albums.d1 = albums_artists.c1) AND (albums.d2 = albums_artists.c2)) INNER JOIN albums_tags ON ((albums_tags.f1 = albums.e1) AND (albums_tags.f2 = albums.e2)) WHERE (((albums_tags.g1, albums_tags.g2) IN ((1234, 85), (2345, 95))) AND (albums_artists.b1 IS NOT NULL) AND (albums_artists.b2 IS NOT NULL))))'
   end
 
   it "should allowing excluding by multiple many_through_many associations" do
     @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]]
-    @c1.exclude(:tags=>[@c2.load(:id=>1234), @c2.load(:id=>2345)]).sql.should == 'SELECT * FROM artists WHERE ((id NOT IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums ON (albums.id = albums_artists.album_id) INNER JOIN albums_tags ON (albums_tags.album_id = albums.id) WHERE ((albums_tags.tag_id IN (1234, 2345)) AND (albums_artists.artist_id IS NOT NULL)))) OR (id IS NULL))'
+    @c1.exclude(:tags=>[@c2.load(:id=>1234), @c2.load(:id=>2345)]).sql.should == 'SELECT * FROM artists WHERE ((artists.id NOT IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums ON (albums.id = albums_artists.album_id) INNER JOIN albums_tags ON (albums_tags.album_id = albums.id) WHERE ((albums_tags.tag_id IN (1234, 2345)) AND (albums_artists.artist_id IS NOT NULL)))) OR (artists.id IS NULL))'
   end
 
   it "should allowing excluding by multiple many_through_many associations with composite keys" do
     @c1.many_through_many :tags, [[:albums_artists, [:b1, :b2], [:c1, :c2]], [:albums, [:d1, :d2], [:e1, :e2]], [:albums_tags, [:f1, :f2], [:g1, :g2]]], :right_primary_key=>[:h1, :h2], :left_primary_key=>[:id, :yyy]
-    @c1.exclude(:tags=>[@c2.load(:h1=>1234, :h2=>85), @c2.load(:h1=>2345, :h2=>95)]).sql.should == 'SELECT * FROM artists WHERE (((id, yyy) NOT IN (SELECT albums_artists.b1, albums_artists.b2 FROM albums_artists INNER JOIN albums ON ((albums.d1 = albums_artists.c1) AND (albums.d2 = albums_artists.c2)) INNER JOIN albums_tags ON ((albums_tags.f1 = albums.e1) AND (albums_tags.f2 = albums.e2)) WHERE (((albums_tags.g1, albums_tags.g2) IN ((1234, 85), (2345, 95))) AND (albums_artists.b1 IS NOT NULL) AND (albums_artists.b2 IS NOT NULL)))) OR (id IS NULL) OR (yyy IS NULL))'
+    @c1.exclude(:tags=>[@c2.load(:h1=>1234, :h2=>85), @c2.load(:h1=>2345, :h2=>95)]).sql.should == 'SELECT * FROM artists WHERE (((artists.id, artists.yyy) NOT IN (SELECT albums_artists.b1, albums_artists.b2 FROM albums_artists INNER JOIN albums ON ((albums.d1 = albums_artists.c1) AND (albums.d2 = albums_artists.c2)) INNER JOIN albums_tags ON ((albums_tags.f1 = albums.e1) AND (albums_tags.f2 = albums.e2)) WHERE (((albums_tags.g1, albums_tags.g2) IN ((1234, 85), (2345, 95))) AND (albums_artists.b1 IS NOT NULL) AND (albums_artists.b2 IS NOT NULL)))) OR (artists.id IS NULL) OR (artists.yyy IS NULL))'
   end
 
   it "should allowing filtering/excluding many_through_many associations with NULL values" do
@@ -157,22 +192,22 @@ describe Sequel::Model, "many_through_many" do
 
   it "should allowing filtering by many_through_many association datasets" do
     @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]]
-    @c1.filter(:tags=>@c2.filter(:x=>1)).sql.should == 'SELECT * FROM artists WHERE (id IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums ON (albums.id = albums_artists.album_id) INNER JOIN albums_tags ON (albums_tags.album_id = albums.id) WHERE ((albums_tags.tag_id IN (SELECT id FROM tags WHERE ((x = 1) AND (id IS NOT NULL)))) AND (albums_artists.artist_id IS NOT NULL))))'
+    @c1.filter(:tags=>@c2.filter(:x=>1)).sql.should == 'SELECT * FROM artists WHERE (artists.id IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums ON (albums.id = albums_artists.album_id) INNER JOIN albums_tags ON (albums_tags.album_id = albums.id) WHERE ((albums_tags.tag_id IN (SELECT tags.id FROM tags WHERE ((x = 1) AND (tags.id IS NOT NULL)))) AND (albums_artists.artist_id IS NOT NULL))))'
   end
 
   it "should allowing filtering by many_through_many association datasets with composite keys" do
     @c1.many_through_many :tags, [[:albums_artists, [:b1, :b2], [:c1, :c2]], [:albums, [:d1, :d2], [:e1, :e2]], [:albums_tags, [:f1, :f2], [:g1, :g2]]], :right_primary_key=>[:h1, :h2], :left_primary_key=>[:id, :yyy]
-    @c1.filter(:tags=>@c2.filter(:x=>1)).sql.should == 'SELECT * FROM artists WHERE ((id, yyy) IN (SELECT albums_artists.b1, albums_artists.b2 FROM albums_artists INNER JOIN albums ON ((albums.d1 = albums_artists.c1) AND (albums.d2 = albums_artists.c2)) INNER JOIN albums_tags ON ((albums_tags.f1 = albums.e1) AND (albums_tags.f2 = albums.e2)) WHERE (((albums_tags.g1, albums_tags.g2) IN (SELECT h1, h2 FROM tags WHERE ((x = 1) AND (h1 IS NOT NULL) AND (h2 IS NOT NULL)))) AND (albums_artists.b1 IS NOT NULL) AND (albums_artists.b2 IS NOT NULL))))'
+    @c1.filter(:tags=>@c2.filter(:x=>1)).sql.should == 'SELECT * FROM artists WHERE ((artists.id, artists.yyy) IN (SELECT albums_artists.b1, albums_artists.b2 FROM albums_artists INNER JOIN albums ON ((albums.d1 = albums_artists.c1) AND (albums.d2 = albums_artists.c2)) INNER JOIN albums_tags ON ((albums_tags.f1 = albums.e1) AND (albums_tags.f2 = albums.e2)) WHERE (((albums_tags.g1, albums_tags.g2) IN (SELECT tags.h1, tags.h2 FROM tags WHERE ((x = 1) AND (tags.h1 IS NOT NULL) AND (tags.h2 IS NOT NULL)))) AND (albums_artists.b1 IS NOT NULL) AND (albums_artists.b2 IS NOT NULL))))'
   end
 
   it "should allowing excluding by many_through_many association datasets" do
     @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]]
-    @c1.exclude(:tags=>@c2.filter(:x=>1)).sql.should == 'SELECT * FROM artists WHERE ((id NOT IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums ON (albums.id = albums_artists.album_id) INNER JOIN albums_tags ON (albums_tags.album_id = albums.id) WHERE ((albums_tags.tag_id IN (SELECT id FROM tags WHERE ((x = 1) AND (id IS NOT NULL)))) AND (albums_artists.artist_id IS NOT NULL)))) OR (id IS NULL))'
+    @c1.exclude(:tags=>@c2.filter(:x=>1)).sql.should == 'SELECT * FROM artists WHERE ((artists.id NOT IN (SELECT albums_artists.artist_id FROM albums_artists INNER JOIN albums ON (albums.id = albums_artists.album_id) INNER JOIN albums_tags ON (albums_tags.album_id = albums.id) WHERE ((albums_tags.tag_id IN (SELECT tags.id FROM tags WHERE ((x = 1) AND (tags.id IS NOT NULL)))) AND (albums_artists.artist_id IS NOT NULL)))) OR (artists.id IS NULL))'
   end
 
   it "should allowing excluding by many_through_many association datasets with composite keys" do
     @c1.many_through_many :tags, [[:albums_artists, [:b1, :b2], [:c1, :c2]], [:albums, [:d1, :d2], [:e1, :e2]], [:albums_tags, [:f1, :f2], [:g1, :g2]]], :right_primary_key=>[:h1, :h2], :left_primary_key=>[:id, :yyy]
-    @c1.exclude(:tags=>@c2.filter(:x=>1)).sql.should == 'SELECT * FROM artists WHERE (((id, yyy) NOT IN (SELECT albums_artists.b1, albums_artists.b2 FROM albums_artists INNER JOIN albums ON ((albums.d1 = albums_artists.c1) AND (albums.d2 = albums_artists.c2)) INNER JOIN albums_tags ON ((albums_tags.f1 = albums.e1) AND (albums_tags.f2 = albums.e2)) WHERE (((albums_tags.g1, albums_tags.g2) IN (SELECT h1, h2 FROM tags WHERE ((x = 1) AND (h1 IS NOT NULL) AND (h2 IS NOT NULL)))) AND (albums_artists.b1 IS NOT NULL) AND (albums_artists.b2 IS NOT NULL)))) OR (id IS NULL) OR (yyy IS NULL))'
+    @c1.exclude(:tags=>@c2.filter(:x=>1)).sql.should == 'SELECT * FROM artists WHERE (((artists.id, artists.yyy) NOT IN (SELECT albums_artists.b1, albums_artists.b2 FROM albums_artists INNER JOIN albums ON ((albums.d1 = albums_artists.c1) AND (albums.d2 = albums_artists.c2)) INNER JOIN albums_tags ON ((albums_tags.f1 = albums.e1) AND (albums_tags.f2 = albums.e2)) WHERE (((albums_tags.g1, albums_tags.g2) IN (SELECT tags.h1, tags.h2 FROM tags WHERE ((x = 1) AND (tags.h1 IS NOT NULL) AND (tags.h2 IS NOT NULL)))) AND (albums_artists.b1 IS NOT NULL) AND (albums_artists.b2 IS NOT NULL)))) OR (artists.id IS NULL) OR (artists.yyy IS NULL))'
   end
 
   it "should support a :conditions option" do
@@ -209,7 +244,7 @@ describe Sequel::Model, "many_through_many" do
   end
   
   it "should support an array for the select option" do
-    @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]], :select=>[:tags.*, :albums__name]
+    @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]], :select=>[Sequel::SQL::ColumnAll.new(:tags), :albums__name]
     n = @c1.load(:id => 1234)
     n.tags_dataset.sql.should == 'SELECT tags.*, albums.name FROM tags INNER JOIN albums_tags ON (albums_tags.tag_id = tags.id) INNER JOIN albums ON (albums.id = albums_tags.album_id) INNER JOIN albums_artists ON ((albums_artists.album_id = albums.id) AND (albums_artists.artist_id = 1234))'
     n.tags.should == [@c2.load(:id=>1)]
@@ -598,6 +633,7 @@ describe "Sequel::Plugins::ManyThroughMany eager loading methods" do
   it "should respect the :limit option on a many_through_many association with composite primary keys on the main table using a :window_function strategy" do
     Tag.dataset.meta_def(:supports_window_functions?){true}
     @c1.set_primary_key([:id1, :id2])
+    @c1.columns :id1, :id2
     @c1.many_through_many :first_two_tags, [[:albums_artists, [:artist_id1, :artist_id2], :album_id], [:albums, :id, :id], [:albums_tags, :album_id, :tag_id]], :class=>Tag, :limit=>2, :eager_limit_strategy=>true, :order=>:name
     @c1.dataset._fetch = [{:id1=>1, :id2=>2}]
     Tag.dataset._fetch = [{:x_foreign_key_0_x=>1, :x_foreign_key_1_x=>2, :id=>5}, {:x_foreign_key_0_x=>1, :x_foreign_key_1_x=>2, :id=>6}]
@@ -878,12 +914,12 @@ describe "Sequel::Plugins::ManyThroughMany eager loading methods" do
   end
 
   it "should respect the association's :graph_block option" do 
-    @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], {:table=>:albums, :left=>:id, :right=>:id}, [:albums_tags, :album_id, :tag_id]], :graph_block=>proc{|ja,lja,js| {:active.qualify(ja)=>true}}
+    @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], {:table=>:albums, :left=>:id, :right=>:id}, [:albums_tags, :album_id, :tag_id]], :graph_block=>proc{|ja,lja,js| {Sequel.qualify(ja, :active)=>true}}
     @c1.eager_graph(:tags).sql.should == 'SELECT artists.id, tags.id AS tags_id FROM artists LEFT OUTER JOIN albums_artists ON (albums_artists.artist_id = artists.id) LEFT OUTER JOIN albums ON (albums.id = albums_artists.album_id) LEFT OUTER JOIN albums_tags ON (albums_tags.album_id = albums.id) LEFT OUTER JOIN tags ON ((tags.id = albums_tags.tag_id) AND (tags.active IS TRUE))'
   end
 
   it "should respect the association's :block option on through" do 
-    @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], {:table=>:albums, :left=>:id, :right=>:id, :block=>proc{|ja,lja,js| {:active.qualify(ja)=>true}}}, [:albums_tags, :album_id, :tag_id]]
+    @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], {:table=>:albums, :left=>:id, :right=>:id, :block=>proc{|ja,lja,js| {Sequel.qualify(ja, :active)=>true}}}, [:albums_tags, :album_id, :tag_id]]
     @c1.eager_graph(:tags).sql.should == 'SELECT artists.id, tags.id AS tags_id FROM artists LEFT OUTER JOIN albums_artists ON (albums_artists.artist_id = artists.id) LEFT OUTER JOIN albums ON ((albums.id = albums_artists.album_id) AND (albums.active IS TRUE)) LEFT OUTER JOIN albums_tags ON (albums_tags.album_id = albums.id) LEFT OUTER JOIN tags ON (tags.id = albums_tags.tag_id)'
   end
 
@@ -907,7 +943,7 @@ describe "Sequel::Plugins::ManyThroughMany eager loading methods" do
   end
 
   it "should only qualify unqualified symbols, identifiers, or ordered versions in association's :order" do
-    @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], {:table=>:albums, :left=>:id, :right=>:id}, [:albums_tags, :album_id, :tag_id]], :order=>[:blah__id.identifier, :blah__id.identifier.desc, :blah__id.desc, :blah__id, :album_id, :album_id.desc, 1, 'RANDOM()'.lit, :a.qualify(:b)]
+    @c1.many_through_many :tags, [[:albums_artists, :artist_id, :album_id], {:table=>:albums, :left=>:id, :right=>:id}, [:albums_tags, :album_id, :tag_id]], :order=>[Sequel.identifier(:blah__id), Sequel.identifier(:blah__id).desc, Sequel.desc(:blah__id), :blah__id, :album_id, Sequel.desc(:album_id), 1, Sequel.lit('RANDOM()'), Sequel.qualify(:b, :a)]
     @c1.order(:artists__blah2, :artists__blah3).eager_graph(:tags).sql.should == 'SELECT artists.id, tags.id AS tags_id FROM artists LEFT OUTER JOIN albums_artists ON (albums_artists.artist_id = artists.id) LEFT OUTER JOIN albums ON (albums.id = albums_artists.album_id) LEFT OUTER JOIN albums_tags ON (albums_tags.album_id = albums.id) LEFT OUTER JOIN tags ON (tags.id = albums_tags.tag_id) ORDER BY artists.blah2, artists.blah3, tags.blah__id, tags.blah__id DESC, blah.id DESC, blah.id, tags.album_id, tags.album_id DESC, 1, RANDOM(), b.a'
   end
 
@@ -932,5 +968,50 @@ describe "Sequel::Plugins::ManyThroughMany eager loading methods" do
     @c1.many_through_many :tags, [{:table=>:albums_artists, :left=>:artist_id, :right=>:album_id, :conditions=>{:a=>:b}}, {:table=>:albums, :left=>:id, :right=>:id}, [:albums_tags, :album_id, :tag_id]]
     @c1.many_through_many :albums, [{:table=>:albums_artists, :left=>:artist_id, :right=>:album_id, :conditions=>{:c=>:d}}]
     @c1.eager_graph(:tags, :albums).sql.should == 'SELECT artists.id, tags.id AS tags_id, albums_0.id AS albums_0_id FROM artists LEFT OUTER JOIN albums_artists ON ((albums_artists.artist_id = artists.id) AND (albums_artists.a = artists.b)) LEFT OUTER JOIN albums ON (albums.id = albums_artists.album_id) LEFT OUTER JOIN albums_tags ON (albums_tags.album_id = albums.id) LEFT OUTER JOIN tags ON (tags.id = albums_tags.tag_id) LEFT OUTER JOIN albums_artists AS albums_artists_0 ON ((albums_artists_0.artist_id = artists.id) AND (albums_artists_0.c = artists.d)) LEFT OUTER JOIN albums AS albums_0 ON (albums_0.id = albums_artists_0.album_id)'
+  end
+end
+
+describe "many_through_many associations with non-column expression keys" do
+  before do
+    @db = Sequel.mock(:fetch=>{:id=>1, :object_ids=>[2]})
+    @Foo = Class.new(Sequel::Model(@db[:foos]))
+    @Foo.columns :id, :object_ids
+    @Foo.plugin :many_through_many
+    m = Module.new{def obj_id; object_ids[0]; end}
+    @Foo.include m
+
+    @Foo.many_through_many :foos, [
+      [:f, Sequel.subscript(:l, 0), Sequel.subscript(:r, 0)],
+      [:f, Sequel.subscript(:l, 1), Sequel.subscript(:r, 1)]
+    ], :class=>@Foo, :left_primary_key=>:obj_id, :left_primary_key_column=>Sequel.subscript(:object_ids, 0), :right_primary_key=>Sequel.subscript(:object_ids, 0), :right_primary_key_method=>:obj_id
+    @foo = @Foo.load(:id=>1, :object_ids=>[2])
+    @db.sqls
+  end
+
+  it "should have working regular association methods" do
+    @Foo.first.foos.should == [@foo]
+    @db.sqls.should == ["SELECT * FROM foos LIMIT 1", "SELECT foos.* FROM foos INNER JOIN f ON (f.r[1] = foos.object_ids[0]) INNER JOIN f AS f_0 ON ((f_0.r[0] = f.l[1]) AND (f_0.l[0] = 2))"]
+  end
+
+  it "should have working eager loading methods" do
+    @db.fetch = [[{:id=>1, :object_ids=>[2]}], [{:id=>1, :object_ids=>[2], :x_foreign_key_x=>2}]]
+    @Foo.eager(:foos).all.map{|o| [o, o.foos]}.should == [[@foo, [@foo]]]
+    @db.sqls.should == ["SELECT * FROM foos", "SELECT foos.*, f_0.l[0] AS x_foreign_key_x FROM foos INNER JOIN f ON (f.r[1] = foos.object_ids[0]) INNER JOIN f AS f_0 ON ((f_0.r[0] = f.l[1]) AND (f_0.l[0] IN (2)))"]
+  end
+
+  it "should have working eager graphing methods" do
+    @db.fetch = {:id=>1, :object_ids=>[2], :foos_0_id=>1, :foos_0_object_ids=>[2]}
+    @Foo.eager_graph(:foos).all.map{|o| [o, o.foos]}.should == [[@foo, [@foo]]]
+    @db.sqls.should == ["SELECT foos.id, foos.object_ids, foos_0.id AS foos_0_id, foos_0.object_ids AS foos_0_object_ids FROM foos LEFT OUTER JOIN f ON (f.l[0] = foos.object_ids[0]) LEFT OUTER JOIN f AS f_0 ON (f_0.l[1] = f.r[0]) LEFT OUTER JOIN foos AS foos_0 ON (foos_0.object_ids[0] = f_0.r[1])"]
+  end
+
+  it "should have working filter by associations with model instances" do
+    @Foo.first(:foos=>@foo).should == @foo
+    @db.sqls.should == ["SELECT * FROM foos WHERE (foos.object_ids[0] IN (SELECT f.l[0] FROM f INNER JOIN f AS f_0 ON (f_0.l[1] = f.r[0]) WHERE ((f_0.r[1] = 2) AND (f.l[0] IS NOT NULL)))) LIMIT 1"]
+  end
+
+  it "should have working filter by associations with model datasets" do
+    @Foo.first(:foos=>@Foo.where(:id=>@foo.id)).should == @foo
+    @db.sqls.should == ["SELECT * FROM foos WHERE (foos.object_ids[0] IN (SELECT f.l[0] FROM f INNER JOIN f AS f_0 ON (f_0.l[1] = f.r[0]) WHERE ((f_0.r[1] IN (SELECT foos.object_ids[0] FROM foos WHERE ((id = 1) AND (foos.object_ids[0] IS NOT NULL)))) AND (f.l[0] IS NOT NULL)))) LIMIT 1"]
   end
 end

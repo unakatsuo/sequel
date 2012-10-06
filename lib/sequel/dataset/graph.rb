@@ -63,6 +63,7 @@ module Sequel
     #                     determines the alias to use.
     # :implicit_qualifier :: The qualifier of implicit conditions, see #join_table.
     # :join_type :: The type of join to use (passed to +join_table+).  Defaults to :left_outer.
+    # :qualify:: The type of qualification to do, see #join_table.
     # :select :: An array of columns to select.  When not used, selects
     #            all columns in the given dataset.  When set to false, selects no
     #            columns and is like simply joining the tables, though graph keeps
@@ -72,9 +73,8 @@ module Sequel
     #                 alias the table.  You will get an error if the the alias (or table) name is
     #                 used more than once.
     def graph(dataset, join_conditions = nil, options = {}, &block)
-      # Allow the use of a model, dataset, or symbol as the first argument
+      # Allow the use of a dataset or symbol as the first argument
       # Find the table name/dataset based on the argument
-      dataset = dataset.dataset if dataset.respond_to?(:dataset)
       table_alias = options[:table_alias]
       case dataset
       when Symbol
@@ -90,7 +90,7 @@ module Sequel
           table_alias ||= dataset_alias((@opts[:num_dataset_sources] || 0)+1)
         end
       else
-        raise Error, "The dataset argument should be a symbol, dataset, or model"
+        raise Error, "The dataset argument should be a symbol or dataset"
       end
 
       # Raise Sequel::Error with explanation that the table alias has been used
@@ -106,7 +106,7 @@ module Sequel
       ds = (!@opts[:graph] && (@opts[:from].length > 1 || @opts[:join])) ? from_self(:alias=>options[:from_self_alias] || first_source) : self
       
       # Join the table early in order to avoid cloning the dataset twice
-      ds = ds.join_table(options[:join_type] || :left_outer, table, join_conditions, :table_alias=>table_alias, :implicit_qualifier=>options[:implicit_qualifier], &block)
+      ds = ds.join_table(options[:join_type] || :left_outer, table, join_conditions, :table_alias=>table_alias, :implicit_qualifier=>options[:implicit_qualifier], :qualify=>options[:qualify], &block)
       opts = ds.opts
 
       # Whether to include the table in the result set

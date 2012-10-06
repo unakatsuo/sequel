@@ -2,7 +2,6 @@
 
 This guide is based on http://guides.rubyonrails.org/migrations.html
 
-
 == Overview
 
 Migrations make it easy to alter your database's schema in a systematic manner.
@@ -14,20 +13,20 @@ create the necessary database structure manually using Sequel's schema
 modification methods or another database tool.  However, if you are dealing
 with other developers, you'll have to send them all of the changes you are
 making.  Even if you aren't dealing with other developers, you generally have
-to make the schema changes in 3 places (development, testing, and 
+to make the schema changes in 3 places (development, testing, and
 production), and it's probably easier to use the migrations system to apply
 the schema changes than it is to keep track of the changes manually and
 execute them manually at the appropriate time.
 
 Sequel tracks which migrations you have already run, so to apply migrations
-you generally need to use run Sequel's migrator with <tt>bin/sequel -m</tt>:
+you generally need to run Sequel's migrator with <tt>bin/sequel -m</tt>:
 
   sequel -m path/to/migrations postgres://host/database
 
 Migrations in Sequel use a very simple DSL via the <tt>Sequel.migration</tt>
 method, and inside the DSL, use the <tt>Sequel::Database</tt> schema
 modification methods such as +create_table+ and +alter_table+.
-See the {schema modification guide}[link:files/doc/schema_modification_rdoc.html] 
+See the {schema modification guide}[link:files/doc/schema_modification_rdoc.html]
 for details on the schema modification methods you can use.
 
 == A Basic Migration
@@ -174,13 +173,49 @@ which just executes the code on the underlying database.
 
 == Errors when running migrations
 
-Sequel attempts to run migrations inside of a transaction.  Some databases do not support
-schema modifications made in transactions, and if the migration raises an error, it will
-not rollback the previous schema changes made by the migration.  In that case, you will
+Sequel attempts to run migrations inside of a transaction if the database supports
+transactional DDL statements.  On the databases that don't support transactional DDL
+statements, if there is an error while running a migration, it will not rollback the
+previous schema changes made by the migration.  In that case, you will
 need to update the database by hand.
 
 It's recommended to always run migrations on a test database and ensure they work
 before running them on any production database.
+
+== Transactions
+
+You can manually specify to use transactions on a per migration basis.  For example,
+if you want to force transaction use for a particular migration, call the transaction
+method in the Sequel.migration block:
+
+  Sequel.migration do
+    transaction
+    change do
+      # ...
+    end
+  end
+
+Likewise, you can disable transaction use via no_transaction:
+
+  Sequel.migration do
+    no_transaction
+    change do
+      # ...
+    end
+  end
+
+This is necessary in some cases, such as when attempting to use CREATE INDEX CONCURRENTLY
+on PostgreSQL (which supports transactional schema, but not that statement inside a
+transaction).
+
+You can also override the transactions setting at the migrator level, either by forcing
+transactions even if no_transaction is set, or by disabling transactions all together:
+
+  # Force transaction use
+  Sequel::Migrator.run(DB, '/path/to/migrations/dir', :use_transactions=>true)
+
+  # Disable use of transactions
+  Sequel::Migrator.run(DB, '/path/to/migrations/dir', :use_transactions=>false)
 
 == Migration files
 
@@ -267,7 +302,7 @@ is important though, as it is used to mean that all migrations should be unappli
 === +TimestampMigrator+ Filenames
 
 With the +TimestampMigrator+, the version integer should represent a timestamp, though this isn't strictly
-required.  
+required.
 
 For example, for <tt>5/10/2010 12:00:00pm</tt>, you could use any of the following formats:
 
@@ -286,6 +321,9 @@ be difficult to unapply some the affected migrations correctly.
 
 The +TimestampMigrator+ will be used if any filename in the migrations directory has a version
 greater than 20000101.  Otherwise, the +IntegerMigrator+ will be used.
+
+You can force the use of the +TimestampMigrator+ in the API by calling TimestampMigrator.apply
+instead of Migrator.apply.
 
 === How to choose
 
@@ -322,8 +360,8 @@ you should give it some thought before using it.
 
 Just don't do it.
 
-In general, you should not modify any migration that has been run on the database and been committed
-the source control repository, unless the migration contains a error that causes data loss.  As long
+In general, you should not modify any migration that has been run on the database and been committed to
+the source control repository, unless the migration contains an error that causes data loss.  As long
 as it is possible to undo the migration without losing data, you should just add another migration
 that undoes the actions of the previous bad migration, and maybe does the correct action afterward.
 
@@ -358,7 +396,7 @@ or they should use the reversible migrations feature with a +change+ block:
 It's usually easy to determine what you should put in your migration's +up+ block,
 as it's whatever change you want to make to the database.  The +down+ block is
 less obvious.  In general, it should reverse the changes made by the +up+ block, which means
-it should execute the opposite of what the +up+ block does in the reverse order in which 
+it should execute the opposite of what the +up+ block does in the reverse order in which
 the +up+ block does it.  Here's an example where you are switching from having a single
 artist per album to multiple artists per album:
 
@@ -402,12 +440,12 @@ artist per album to multiple artists per album:
     end
   end
 
-Note that the order in which things were done in the +down+ block is in
-reverse order to how they were done in the +up+ block.  Also note how it
-isn't always possible to reverse exactly what was done in the +up+ block.
-You should try to do so as much as possible, but if you can't, you may
-want to have your +down+ block raise a <tt>Sequel::Error</tt> exception
-saying why the migration cannot be reverted.
+Note that the operations performed in the +down+ block are performed in the
+reverse order of how they are performed in the +up+ block.  Also note how it
+isn't always possible to reverse exactly what was done in the +up+ block.  You
+should try to do so as much as possible, but if you can't, you may want to have
+your +down+ block raise a <tt>Sequel::Error</tt> exception saying why the
+migration cannot be reverted.
 
 == Running migrations
 
@@ -485,16 +523,33 @@ The main difference between the two is that <tt>-d</tt> will use the type method
 with the database independent ruby class types, while <tt>-D</tt> will use
 the +column+ method with string types.
 
-Note that Sequel cannot dump constraints other than primary key constraints,
-so it dumps foreign key columns as plain integers.  If you are using any real
-database features such as foreign keys, constraints, or triggers, you should
-use your database's dump and restore programs instead of Sequel's schema
-dumper.
+Note that Sequel cannot dump constraints other than primary key and possibly
+foreign key constraints.  If you are using database features such
+as constraints or triggers, you should use your database's dump and restore
+programs instead of Sequel's schema dumper.
 
 You can take the migration created by the schema dumper to another computer
 with an empty database, and attempt to recreate the schema using:
 
   sequel -m db/migrations postgres://host/database
+
+== Checking for Current Migrations
+
+In your application code, you may want to check that you are up to date in
+regards to migrations (i.e. you don't have any unapplied migrations).  Sequel
+offers two separate methods to do that.  The first is Sequel::Migrator.check_current.
+This method raises an exception if there are outstanding migrations that need to
+be run.  The second is Sequel::Migrator.is_current?, which returns true if there
+are no outstanding migrations, and false if there are outstanding migrations.
+
+If you want to ensure that your application code is up to date, you may want to
+add the following code after connecting to your database:
+
+  Sequel.extension :migration
+  Sequel::Migrator.check_current(DB, '/path/to/migrations')
+
+This will cause your application to raise an error when you start it if you have
+any outstanding migrations.
 
 == Old-style migration classes
 

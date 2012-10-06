@@ -1,3 +1,19 @@
+# These are extensions to core classes that Sequel enables by default.
+# They make using Sequel's DSL easier by adding methods to Array,
+# Hash, String, and Symbol to add methods that return Sequel
+# expression objects.
+#
+# This extension is currently loaded by default, but that will no
+# longer be true in a future version.  In a future version, you will
+# need to load it manually via:
+#
+#   Sequel.extension :core_extensions
+
+# This extension loads the core extensions.
+def Sequel.core_extensions?
+  true
+end
+
 # Sequel extends +Array+ to add methods to implement the SQL DSL.
 # Most of these methods require that the array not be empty and that it
 # must consist solely of other arrays that have exactly two elements.
@@ -8,20 +24,7 @@ class Array
   #   ~[[:a, true]] # SQL: a IS NOT TRUE
   #   ~[[:a, 1], [:b, [2, 3]]] # SQL: a != 1 OR b NOT IN (2, 3)
   def ~
-    sql_expr_if_all_two_pairs(:OR, true)
-  end
-
-  # +true+ if the array is not empty and all of its elements are
-  # arrays of size 2, +false+ otherwise.  This is used to determine if the array
-  # could be a specifier of conditions, used similarly to a hash
-  # but allowing for duplicate keys and a specific order.
-  #
-  #    [].to_a.all_two_pairs? # => false
-  #    [:a].to_a.all_two_pairs? # => false
-  #    [[:b]].to_a.all_two_pairs? # => false
-  #    [[:a, 1]].to_a.all_two_pairs? # => true
-  def all_two_pairs?
-    !empty? && all?{|i| (Array === i) && (i.length == 2)}
+    Sequel.~(self)
   end
 
   # Return a <tt>Sequel::SQL::CaseExpression</tt> with this array as the conditions and the given
@@ -59,7 +62,7 @@ class Array
   #   [[:a, true]].sql_expr # SQL: a IS TRUE
   #   [[:a, 1], [:b, [2, 3]]].sql_expr # SQL: a = 1 AND b IN (2, 3)
   def sql_expr
-    sql_expr_if_all_two_pairs
+    Sequel.expr(self)
   end
 
   # Return a <tt>Sequel::SQL::BooleanExpression</tt> created from this array, matching none
@@ -68,7 +71,7 @@ class Array
   #   [[:a, true]].sql_negate # SQL: a IS NOT TRUE
   #   [[:a, 1], [:b, [2, 3]]].sql_negate # SQL: a != 1 AND b NOT IN (2, 3)
   def sql_negate
-    sql_expr_if_all_two_pairs(:AND, true)
+    Sequel.negate(self)
   end
 
   # Return a <tt>Sequel::SQL::BooleanExpression</tt> created from this array, matching any of the
@@ -77,10 +80,10 @@ class Array
   #   [[:a, true]].sql_or # SQL: a IS TRUE
   #   [[:a, 1], [:b, [2, 3]]].sql_or # SQL: a = 1 OR b IN (2, 3)
   def sql_or
-    sql_expr_if_all_two_pairs(:OR)
+    Sequel.or(self)
   end
 
-  # Return a <tt>Sequel::SQL::BooleanExpression</tt> representing an SQL string made up of the
+  # Return a <tt>Sequel::SQL::StringExpression</tt> representing an SQL string made up of the
   # concatenation of this array's elements.  If an argument is passed
   # it is used in between each element of the array in the SQL
   # concatenation.
@@ -90,22 +93,7 @@ class Array
   #   [:a, 'b'].sql_string_join # SQL: a || 'b'
   #   ['a', :b].sql_string_join(' ') # SQL: 'a' || ' ' || b
   def sql_string_join(joiner=nil)
-    if joiner
-      args = zip([joiner]*length).flatten
-      args.pop
-    else
-      args = self
-    end
-    args = args.collect{|a| [Symbol, ::Sequel::SQL::Expression, ::Sequel::LiteralString, TrueClass, FalseClass, NilClass].any?{|c| a.is_a?(c)} ? a : a.to_s}
-    ::Sequel::SQL::StringExpression.new(:'||', *args)
-  end
-
-  private
-
-  # Raise an error if this array is not made up all two element arrays, otherwise create a <tt>Sequel::SQL::BooleanExpression</tt> from this array.
-  def sql_expr_if_all_two_pairs(*args)
-    raise(Sequel::Error, 'Not all elements of the array are arrays of size 2, so it cannot be converted to an SQL expression') unless all_two_pairs?
-    ::Sequel::SQL::BooleanExpression.from_value_pairs(self, *args)
+    Sequel.join(self, joiner)
   end
 end
 
@@ -211,28 +199,24 @@ end
 
 # Sequel extends +Symbol+ to add methods to implement the SQL DSL.
 class Symbol
-  include Sequel::SQL::QualifyingMethods
-  include Sequel::SQL::IdentifierMethods
   include Sequel::SQL::AliasMethods
   include Sequel::SQL::CastMethods
   include Sequel::SQL::OrderMethods
   include Sequel::SQL::BooleanMethods
   include Sequel::SQL::NumericMethods
+  include Sequel::SQL::QualifyingMethods
   include Sequel::SQL::StringMethods
   include Sequel::SQL::SubscriptMethods
   include Sequel::SQL::ComplexExpressionMethods
   include Sequel::SQL::InequalityMethods if RUBY_VERSION < '1.9.0'
 
-  # If no argument is given, returns a <tt>Sequel::SQL::ColumnAll</tt> object specifying all
-  # columns for this table.
-  # If an argument is given, returns a <tt>Sequel::SQL::NumericExpression</tt> using the *
-  # (multiplication) operator with this and the given argument.
-  # 
-  #   :table.* # SQL: table.*
-  #   :column * 2 # SQL: column * 2
-  def *(ce=(arg=false;nil))
-    return super(ce) unless arg == false
-    Sequel::SQL::ColumnAll.new(self);
+  # Returns receiver wrapped in an <tt>Sequel::SQL::Identifier</tt>.  Usually used to
+  # prevent splitting the symbol.
+  #
+  #   :a__b # SQL: "a"."b"
+  #   :a__b.identifier # SQL: "a__b"
+  def identifier
+    Sequel::SQL::Identifier.new(self)
   end
 
   # Returns a <tt>Sequel::SQL::Function</tt> with this as the function name,

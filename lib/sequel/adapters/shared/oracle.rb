@@ -17,7 +17,7 @@ module Sequel
       end
 
       def current_user
-        @current_user ||= get{sys_context('USERENV', 'CURRENT_USER')}
+        @current_user ||= metadata_dataset.get{sys_context('USERENV', 'CURRENT_USER')}
       end
 
       def drop_sequence(name)
@@ -29,18 +29,24 @@ module Sequel
         :oracle
       end
 
+      # Oracle namespaces indexes per table.
+      def global_index_namespace?
+        false
+      end
+
       def tables(opts={})
-        ds = from(:tab).server(opts[:server]).select(:tname).filter(:tabtype => 'TABLE')
-        ds.map{|r| ds.send(:output_identifier, r[:tname])}
+        m = output_identifier_meth
+        metadata_dataset.from(:tab).server(opts[:server]).select(:tname).filter(:tabtype => 'TABLE').map{|r| m.call(r[:tname])}
       end
 
       def views(opts={}) 
-        ds = from(:tab).server(opts[:server]).select(:tname).filter(:tabtype => 'VIEW') 
-        ds.map{|r| ds.send(:output_identifier, r[:tname])} 
+        m = output_identifier_meth
+        metadata_dataset.from(:tab).server(opts[:server]).select(:tname).filter(:tabtype => 'VIEW').map{|r| m.call(r[:tname])}
       end 
  
       def view_exists?(name) 
-        from(:tab).filter(:tname =>dataset.send(:input_identifier, name), :tabtype => 'VIEW').count > 0 
+        m = input_identifier_meth
+        metadata_dataset.from(:tab).filter(:tname =>m.call(name), :tabtype => 'VIEW').count > 0 
       end 
 
       private
@@ -172,13 +178,18 @@ module Sequel
       def temporary_table_sql
         TEMPORARY
       end
+
+      # Oracle uses clob for text types.
+      def uses_clob_for_text?
+        true
+      end
     end
 
     module DatasetMethods
       include EmulateOffsetWithRowNumber
 
       SELECT_CLAUSE_METHODS = Dataset.clause_methods(:select, %w'with select distinct columns from join where group having compounds order lock')
-      ROW_NUMBER_EXPRESSION = 'ROWNUM'.lit.freeze
+      ROW_NUMBER_EXPRESSION = LiteralString.new('ROWNUM').freeze
       SPACE = Dataset::SPACE
       APOS = Dataset::APOS
       APOS_RE = Dataset::APOS_RE
@@ -216,6 +227,8 @@ module Sequel
           sql << complex_expression_arg_pairs(args){|a, b| "(#{literal(a)} * power(2, #{literal b}))"}
         when :>>
           sql << complex_expression_arg_pairs(args){|a, b| "(#{literal(a)} / power(2, #{literal b}))"}
+        when :%
+          sql << complex_expression_arg_pairs(args){|a, b| "MOD(#{literal(a)}, #{literal(b)})"}
         when :ILIKE, :'NOT ILIKE'
           sql << ILIKE_0
           literal_append(sql, args.at(0))
@@ -240,6 +253,20 @@ module Sequel
         end
       end
 
+      # Oracle treats empty strings like NULL values, and doesn't support
+      # char_length, so make char_length use length with a nonempty string.
+      # Unfortunately, as Oracle treats the empty string as NULL, there is
+      # no way to get trim to return an empty string instead of nil if
+      # the string only contains spaces.
+      def emulated_function_sql_append(sql, f)
+        case f.f
+        when :char_length
+          literal_append(sql, Sequel::SQL::Function.new(:length, Sequel.join([f.args.first, 'x'])) - 1)
+        else
+          super
+        end
+      end
+      
       # Oracle uses MINUS instead of EXCEPT, and doesn't support EXCEPT ALL
       def except(dataset, opts={})
         opts = {:all=>opts} unless opts.is_a?(Hash)
@@ -247,8 +274,10 @@ module Sequel
         compound_clone(:minus, dataset, opts)
       end
 
+      # Use a custom expression with EXISTS to determine whether a dataset
+      # is empty.
       def empty?
-        db[:dual].where(unordered.exists).get(1) == nil
+        db[:dual].where(@opts[:offset] ? exists : unordered.exists).get(1) == nil
       end
 
       # Oracle requires SQL standard datetimes
@@ -280,6 +309,16 @@ module Sequel
 
       # Oracle requires recursive CTEs to have column aliases.
       def recursive_cte_requires_column_aliases?
+        true
+      end
+
+      # Oracle supports GROUP BY CUBE
+      def supports_group_cube?
+        true
+      end
+
+      # Oracle supports GROUP BY ROLLUP
+      def supports_group_rollup?
         true
       end
 

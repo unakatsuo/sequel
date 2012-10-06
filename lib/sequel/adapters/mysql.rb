@@ -29,6 +29,9 @@ module Sequel
 
     class << self
       # Whether to convert invalid date time values by default.
+      #
+      # Only applies to Sequel::Database instances created after this
+      # has been set.
       attr_accessor :convert_invalid_date_time
     end
     self.convert_invalid_date_time = false
@@ -38,8 +41,9 @@ module Sequel
       include Sequel::MySQL::DatabaseMethods
       include Sequel::MySQL::PreparedStatements::DatabaseMethods
       
-      # Mysql::Error messages that indicate the current connection should be disconnected
-      MYSQL_DATABASE_DISCONNECT_ERRORS = /\A(Commands out of sync; you can't run this command now|Can't connect to local MySQL server through socket|MySQL server has gone away|Lost connection to MySQL server during query)/
+      # Regular expression used for getting accurate number of rows
+      # matched by an update statement.
+      AFFECTED_ROWS_RE = /Rows matched:\s+(\d+)\s+Changed:\s+\d+\s+Warnings:\s+\d+/.freeze
       
       set_adapter_scheme :mysql
 
@@ -111,19 +115,13 @@ module Sequel
           Mysql::CLIENT_MULTI_STATEMENTS +
           (opts[:compress] == false ? 0 : Mysql::CLIENT_COMPRESS)
         )
-        sqls = []
+        sqls = mysql_connection_setting_sqls
+
         # Set encoding a slightly different way after connecting,
         # in case the READ_DEFAULT_GROUP overrode the provided encoding.
         # Doesn't work across implicit reconnects, but Sequel doesn't turn on
         # that feature.
-        sqls << "SET NAMES #{literal(encoding.to_s)}" if encoding
-
-        # Increase timeout so mysql server doesn't disconnect us
-        # Value used by default is maximum allowed value on Windows.
-        sqls << "SET @@wait_timeout = #{opts[:timeout] || 2147483}"
-
-        # By default, MySQL 'where id is null' selects the last inserted id
-        sqls << "SET SQL_AUTO_IS_NULL=0" unless opts[:auto_is_null]
+        sqls.unshift("SET NAMES #{literal(encoding.to_s)}") if encoding
 
         sqls.each{|sql| log_yield(sql){conn.query(sql)}}
 
@@ -152,6 +150,16 @@ module Sequel
         @convert_tinyint_to_bool = v
       end
 
+      # Return the number of matched rows when executing a delete/update statement.
+      def execute_dui(sql, opts={})
+        execute(sql, opts){|c| return affected_rows(c)}
+      end
+
+      # Return the last inserted id when executing an insert statement.
+      def execute_insert(sql, opts={})
+        execute(sql, opts){|c| return c.insert_id}
+      end
+
       # Return the version of the MySQL server two which we are connecting.
       def server_version(server=nil)
         @server_version ||= (synchronize(server){|conn| conn.server_version if conn.respond_to?(:server_version)} || super)
@@ -164,7 +172,7 @@ module Sequel
       # yield the connection if a block is given.
       def _execute(conn, sql, opts)
         begin
-          r = log_yield(sql){conn.query(sql)}
+          r = log_yield((log_sql = opts[:log_sql]) ? sql + log_sql : sql){conn.query(sql)}
           if opts[:type] == :select
             yield r if r
           elsif block_given?
@@ -206,6 +214,18 @@ module Sequel
         end
       end
       
+      # Try to get an accurate number of rows matched using the query
+      # info.  Fall back to affected_rows if there was no match, but
+      # that may be inaccurate.
+      def affected_rows(conn)
+        s = conn.info
+        if s && s =~ AFFECTED_ROWS_RE
+          $1.to_i
+        else
+          conn.affected_rows
+        end
+      end
+
       # MySQL connections use the query method to execute SQL without a result
       def connection_execute_method
         :query
@@ -265,16 +285,11 @@ module Sequel
       include Sequel::MySQL::PreparedStatements::DatasetMethods
 
       Database::DatasetClass = self
-      
-      # Delete rows matching this dataset
-      def delete
-        execute_dui(delete_sql){|c| return c.affected_rows}
-      end
-      
+
       # Yield all rows matching this dataset.  If the dataset is set to
       # split multiple statements, yield arrays of hashes one per statement
       # instead of yielding results for all statements as hashes.
-      def fetch_rows(sql, &block)
+      def fetch_rows(sql)
         execute(sql) do |r|
           i = -1
           cps = db.conversion_procs
@@ -282,7 +297,7 @@ module Sequel
             # Pretend tinyint is another integer type if its length is not 1, to
             # avoid casting to boolean if Sequel::MySQL.convert_tinyint_to_bool
             # is set.
-            type_proc = f.type == 1 && f.length != 1 ? cps[2] : cps[f.type]
+            type_proc = f.type == 1 && cast_tinyint_integer?(f) ? cps[2] : cps[f.type]
             [output_identifier(f.name), type_proc, i+=1]
           end
           @columns = cols.map{|c| c.first}
@@ -291,7 +306,7 @@ module Sequel
             yield_rows(r, cols){|h| s << h}
             yield s
           else
-            yield_rows(r, cols, &block)
+            yield_rows(r, cols){|h| yield h}
           end
         end
         self
@@ -301,16 +316,6 @@ module Sequel
       def graph(*)
         raise(Error, "Can't graph a dataset that splits multiple result sets") if opts[:split_multiple_result_sets]
         super
-      end
-      
-      # Insert a new value into this dataset
-      def insert(*values)
-        execute_dui(insert_sql(*values)){|c| return c.insert_id}
-      end
-      
-      # Replace (update or insert) the matching row.
-      def replace(*args)
-        execute_dui(replace_sql(*args)){|c| return c.insert_id}
       end
       
       # Makes each yield arrays of rows, with each array containing the rows
@@ -329,21 +334,18 @@ module Sequel
         ds
       end
       
-      # Update the matching rows.
-      def update(values={})
-        execute_dui(update_sql(values)){|c| return c.affected_rows}
-      end
-      
       private
+
+      # Whether a tinyint field should be casted as an integer.  By default,
+      # casts to integer if the field length is not 1.  Can be overwritten
+      # to make tinyint casting dataset dependent.
+      def cast_tinyint_integer?(field)
+        field.length != 1
+      end
       
       # Set the :type option to :select if it hasn't been set.
       def execute(sql, opts={}, &block)
         super(sql, {:type=>:select}.merge(opts), &block)
-      end
-      
-      # Set the :type option to :dui if it hasn't been set.
-      def execute_dui(sql, opts={}, &block)
-        super(sql, {:type=>:dui}.merge(opts), &block)
       end
       
       # Handle correct quoting of strings using ::MySQL.quote.

@@ -9,10 +9,10 @@ describe "Supported types" do
   specify "should support casting correctly" do
     ds = create_items_table_with_column(:number, Integer)
     ds.insert(:number => 1)
-    ds.select(:number.cast_string.as(:n)).map(:n).should == %w'1'
+    ds.select(Sequel.cast(:number, String).as(:n)).map(:n).should == %w'1'
     ds = create_items_table_with_column(:name, String)
     ds.insert(:name=> '1')
-    ds.select(:name.cast_numeric.as(:n)).map(:n).should == [1]
+    ds.select(Sequel.cast(:name, Integer).as(:n)).map(:n).should == [1]
   end
 
   specify "should support NULL correctly" do
@@ -60,6 +60,15 @@ describe "Supported types" do
     ds.all.should == [{:name=>'Test User'}]
   end
   
+  specify "should support generic text type" do
+    ds = create_items_table_with_column(:name, String, :text=>true)
+    ds.insert(:name => 'Test User'*100)
+    ds.all.should == [{:name=>'Test User'*100}]
+
+    ds.update(:name=>ds.get(:name))
+    ds.all.should == [{:name=>'Test User'*100}]
+  end
+  
   cspecify "should support generic date type", [:do, :sqlite], [:jdbc, :sqlite], :mssql, :oracle do
     ds = create_items_table_with_column(:dat, Date)
     d = Date.today
@@ -68,7 +77,7 @@ describe "Supported types" do
     ds.first[:dat].to_s.should == d.to_s
   end
   
-  cspecify "should support generic time type", [:do], [:swift], [:odbc], [:jdbc, :mssql], [:jdbc, :postgres], [:jdbc, :sqlite], [:mysql2], [:tinytds], :oracle do
+  cspecify "should support generic time type", [:do], [:swift], [:odbc], [:jdbc, :mssql], [:jdbc, :sqlite], [:mysql2], [:tinytds], :oracle do
     ds = create_items_table_with_column(:tim, Time, :only_time=>true)
     t = Sequel::SQLTime.now
     ds.insert(:tim => t)
@@ -93,10 +102,10 @@ describe "Supported types" do
     ds.first[:tim].strftime('%Y%m%d%H%M%S').should == t.strftime('%Y%m%d%H%M%S')
   end
   
-  cspecify "should support generic file type", [:do], [:odbc, :mssql], [:mysql2], [:swift], [:tinytds] do
+  cspecify "should support generic file type", [:do], [:odbc, :mssql], [:mysql2], [:tinytds] do
     ds = create_items_table_with_column(:name, File)
-    ds.insert(:name => ("a\0"*300).to_sequel_blob)
-    ds.all.should == [{:name=>("a\0"*300).to_sequel_blob}]
+    ds.insert(:name =>Sequel.blob("a\0"*300))
+    ds.all.should == [{:name=>Sequel.blob("a\0"*300)}]
     ds.first[:name].should be_a_kind_of(::Sequel::SQL::Blob)
   end
   
@@ -107,5 +116,14 @@ describe "Supported types" do
     ds = create_items_table_with_column(:number, FalseClass)
     ds.insert(:number => true)
     ds.all.should == [{:number=>true}]
+  end
+  
+  cspecify "should support generic boolean type with defaults", [:do, :sqlite], [:jdbc, :sqlite], [:jdbc, :db2], [:odbc, :mssql], :oracle do
+    ds = create_items_table_with_column(:number, TrueClass, :default=>true)
+    ds.insert
+    ds.all.should == [{:number=>true}]
+    ds = create_items_table_with_column(:number, FalseClass, :default=>false)
+    ds.insert
+    ds.all.should == [{:number=>false}]
   end
 end

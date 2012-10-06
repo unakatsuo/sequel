@@ -80,18 +80,13 @@ When using the type name as method, the third argument is an options hash, and w
 method, the fourth argument is the options hash.  The following options are supported:
 
 :default :: The default value for the column.
-:index :: Create an index on this column.
+:index :: Create an index on this column. If given a hash, use the hash as the
+          options for the index.
 :null :: Mark the column as allowing NULL values (if true),
          or not allowing NULL values (if false).  If unspecified, will default
          to whatever the database default is.
-:size :: The size of the column, generally used with string
-         columns to specify the maximum number of characters the column will hold.
-         An array of two integers can be provided to set the size and the
-         precision, respectively, of decimal columns.
 :unique :: Mark the column as unique, generally has the same effect as
            creating a unique index on the column.
-:unsigned :: Make the column type unsigned, only useful for integer
-             columns.
 
 === Other methods
 
@@ -102,6 +97,10 @@ In addition to the +column+ method and other methods that create columns, there 
 You've seen this one used already.  It's used to create an autoincrementing integer primary key column.
 
   create_table(:a0){primary_key :id}
+
+If you want an autoincrementing 64-bit integer:
+
+  create_table(:a0){primary_key :id, :type=>Bignum}
 
 If you want to create a primary key column that doesn't use an autoincrementing integer, you should
 not use this method.  Instead, you should use the :primary_key option to the +column+ method or type
@@ -143,9 +142,10 @@ as it's third argument.  A simple example is:
         on most databases.
 :on_delete :: Specify the behavior of this foreign key column when the row with the primary key
               it references is deleted , can be :restrict, :cascade, :set_null, or :set_default.
+              You can also use a string, which is used literally.
 :on_update :: Specify the behavior of this foreign key column when the row with the primary key
-              it references modifies the value of the primary key, can be
-              :restrict, :cascade, :set_null, or :set_default.
+              it references modifies the value of the primary key.  Takes the same options as
+              :on_delete.
 
 Like +primary_key+, if you provide +foreign_key+ with an array of symbols, it will not create a
 column, but create a foreign key constraint:
@@ -172,6 +172,13 @@ column, but create a foreign key constraint:
   create_table(:a) do
     Integer :id
     index :id
+  end
+
+  create_table(:a){Integer :id, :index=>{:unique=>true}}
+  # Same as:
+  create_table(:a) do
+    Integer :id
+    index :id, :unique=>true
   end
 
 Similar to the +primary_key+ and +foreign_key+ methods, calling +index+ with an array of symbols
@@ -234,12 +241,12 @@ both take the same options as +index+.
   end
   
 Instead of using a block, you can use arguments that will be handled similarly
-to <tt>Dataset#filter</tt>:
+to <tt>Dataset#where</tt>:
 
   create_table(:artists) do
     primary_key :id
     String :name
-    constraint(:name_length_range, :char_length.sql_function(:name)=>3..50)
+    constraint(:name_length_range, Sequel.function(:char_length, :name)=>3..50)
   end
   
 ==== +check+
@@ -253,6 +260,28 @@ and it creates an unnamed constraint
     check{char_length(name) > 2}
   end
   
+== +create_join_table+
+
++create_join_table+ is a shortcut that you can use to create simple many-to-many join tables:
+
+  create_join_table(:artist_id=>:artists, :album_id=>:albums)
+
+which expands to:
+
+  create_table(:albums_artists) do
+    foreign_key :album_id, :albums, :null=>false
+    foreign_key :artist_id, :artists, :null=>false
+    primary_key [:album_id, :artist_id]
+    index [:artist_id, :album_id]
+  end
+
+== <tt>create_table :as=></tt>
+
+To create a table from the result of a SELECT query, instead of passing a block
+to +create_table+, provide a dataset to the :as option:
+
+  create_table(:older_items, :as=>DB[:items].where{updated_at < Date.today << 6})
+
 == +alter_table+
 
 +alter_table+ is used to alter existing tables, changing their columns, indexes,
@@ -269,9 +298,6 @@ hash:
   alter_table(:albums) do
     add_column :copies_sold, Integer, :default=>0
   end
-
-When adding a column, it's a good idea to provide a default value, unless you
-want the value for all rows to be set to NULL.
 
 === +drop_column+
 
@@ -410,7 +436,7 @@ There is no database independent method to drop an unnamed constraint.  Generall
 database will give it a name automatically, and you will have to figure out what it is.
 For that reason, you should not add unnamed constraints that you ever might need to remove.
 
-On MySQL, you must specify the type of constraint via a <tt>:type</tt> option:
+On some databases, you must specify the type of constraint via a <tt>:type</tt> option:
 
   alter_table(:albums) do
     drop_constraint(:albums_pk, :type=>:primary_key)
@@ -484,6 +510,16 @@ if you are using foreign keys and the database is enforcing referential
 integrity.  In general, you need to drop the tables containing the foreign
 keys before the tables containing the primary keys they reference.
 
+=== <tt>drop_table?</tt>
+
+<tt>drop_table?</tt> is similar to drop_table, except that it only drops
+the table if the table does not already exist.  On some databases, it uses
+<tt>IF NOT EXISTS</tt>, on others it does a separate query to check for
+existence.
+
+This should not be used inside migrations, as if the the tbale does not
+exist, it may mess up the migration.
+
 === +rename_table+
 
 You can rename an existing table using +rename_table+.  Like +rename_column+,
@@ -493,17 +529,17 @@ the first argument is the current name, and the second is the new name:
 
 === <tt>create_table!</tt>
 
-<tt>create_table!</tt> with the bang drops the table if it exists
+<tt>create_table!</tt> drops the table if it exists
 before attempting to create it, so:
 
-  create_table!(:artists)
+  create_table!(:artists) do
     primary_key :id
   end
 
 is the same as:
 
-  drop_table(:artists) if table_exists?(:artists)
-  create_table(:artists)
+  drop_table?(:artists)
+  create_table(:artists) do
     primary_key :id
   end
 
@@ -512,18 +548,20 @@ mess up the migration.
 
 === <tt>create_table?</tt>
 
-<tt>create_table?</tt> with a question mark only creates the table if it does
+<tt>create_table?</tt> only creates the table if it does
 not already exist, so:
 
-  create_table!(:artists)
+  create_table?(:artists) do
     primary_key :id
   end
 
 is the same as:
 
-  create_table(:artists)
-    primary_key :id
-  end unless table_exists?(:artists)
+  unless table_exists?(:artists)
+    create_table(:artists) do
+      primary_key :id
+    end 
+  end
 
 Like <tt>create_table!</tt>, it should not be used inside migrations.
 
@@ -535,7 +573,7 @@ the same name, while +create_view+ will probably raise an error.  Both methods
 take the name as the first argument, and either an string or a dataset as the
 second argument:
 
-  create_view(:gold_albums, DB[:albums].filter{copies_sold > 500000})
+  create_view(:gold_albums, DB[:albums].where{copies_sold > 500000})
   create_or_replace_view(:gold_albums, "SELECT * FROM albums WHERE copies_sold > 500000")
 
 === +drop_view+

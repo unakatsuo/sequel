@@ -7,6 +7,7 @@ describe "instance_filters plugin" do
     @c.columns :id, :name, :num
     @c.plugin :instance_filters
     @p = @c.load(:id=>1, :name=>'John', :num=>1)
+    MODEL_DB.sqls
   end
 
   specify "should raise an error when updating a stale record" do
@@ -20,7 +21,7 @@ describe "instance_filters plugin" do
 
   specify "should raise an error when destroying a stale record" do
     @p.destroy
-    MODEL_DB.sqls.should == ["DELETE FROM people WHERE (id = 1)"]
+    MODEL_DB.sqls.should == ["DELETE FROM people WHERE id = 1"]
     @p.instance_filter(:name=>'Jim')
     @p.this.numrows = 0
     proc{@p.destroy}.should raise_error(Sequel::Plugins::InstanceFilters::Error)

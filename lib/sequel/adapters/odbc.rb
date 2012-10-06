@@ -22,9 +22,9 @@ module Sequel
           extend Sequel::Progress::DatabaseMethods
           extend_datasets(Sequel::Progress::DatasetMethods)
         when 'db2'
-          Sequel.ts_require 'adapters/odbc/db2'
-          extend Sequel::ODBC::DB2::DatabaseMethods
-          @dataset_class = Sequel::ODBC::DB2::Dataset
+          Sequel.ts_require 'adapters/shared/db2'
+          extend ::Sequel::DB2::DatabaseMethods
+          extend_datasets ::Sequel::DB2::DatasetMethods
         end
       end
 

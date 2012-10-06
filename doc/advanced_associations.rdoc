@@ -14,7 +14,7 @@ a different block when eager loading via <tt>Dataset#eager</tt>. Association blo
 useful for things like:
 
   Artist.one_to_many :gold_albums, :class=>:Album do |ds|
-    ds.filter{copies_sold > 500000}
+    ds.where{copies_sold > 500000}
   end
 
 There are a whole bunch of options for changing how the association is eagerly
@@ -50,12 +50,12 @@ These can be used like this:
     
   # Only returns albums that have sold more than 500,000 copies
   Artist.one_to_many :gold_albums, :class=>:Album, \
-    :graph_block=>proc{|j,lj,js| :copies_sold.qualify(j) > 500000}
+    :graph_block=>proc{|j,lj,js| Sequel.qualify(j, :copies_sold) > 500000}
     
   # Handles the case where the tables are associated by a case insensitive name string
   Artist.one_to_many :albums, :key=>:artist_name, \
     :graph_only_conditions=>nil, \
-    :graph_block=>proc{|j,lj,js| {:lower.sql_function(artist_name.qualify(j))=>:lower.sql_function(name.qualify(lj))}}
+    :graph_block=>proc{|j,lj,js| {Sequel.function(:lower, Sequel.qualify(j, :artist_name))=>Sequel.function(:lower, Sequel.qualify(lj, :name))}}
     
   # Handles the case where both key columns have the name artist_name, and you want to use
   # a JOIN USING
@@ -75,19 +75,15 @@ option.  Though it can often be verbose (compared to other things in Sequel),
 it allows you complete control over how to eagerly load associations for a
 group of objects.
 
-:eager_loader should be a proc that takes 1 or 3 arguments.  If the proc
-takes one argument, it will be given a hash with the following keys:
+:eager_loader should be a proc that takes a single hash argument, which will
+have at least the following keys:
 
-:key_hash :: A key_hash, described below
+:id_map :: A mapping of key values to arrays of current model instances,
+           usage described below
 :rows :: An array of model objects
 :associations :: A hash of dependent associations to eagerly load
 :self :: The dataset that is doing the eager loading
-
-If the proc takes three arguments, it gets passed the :key_hash, :rows,
-and :associations values.  The only way to get the :self value is to
-accept one argument.  The 3 argument procs are allowed for backwards
-compatibility, and it is recommended to use the 1 argument proc format
-for new code.
+:eager_block :: A dynamic callback for this eager load.
 
 Since you are given all of the records, you can do things like filter on
 associations that are specified by multiple keys, or do multiple
@@ -96,25 +92,141 @@ necessary for polymorphic associations).  Inside the <tt>:eager_loader</tt>
 proc, you should get the related objects and populate the
 associations cache for all objects in the array of records.  The hash
 of dependent associations is available for you to cascade the eager
-loading down multiple levels, but it is up to you to use it.  The
-key_hash is a performance enhancement that is used by the default
-association loaders and is also available to you.  It is a hash with keys being
-foreign/primary key symbols in the current table, and the values
-being hashes where the key is foreign/primary key values and values
-being arrays of current model objects having the foreign/primary key
-value associated with the key.  This is hard to visualize, so I'll
-give an example:
-    
-  album1 = Album.load(:id=>1, :artist_id=>2)
-  album2 = Album.load(:id=>3, :artist_id=>2)
+loading down multiple levels, but it is up to you to use it.
+
+The id_map is a performance enhancement that is used by the default
+association loaders and is also available to you.  It is a hash with keys
+foreign/primary key values, and values being arrays of current model
+objects having the foreign/primary key value associated with the key. 
+This may be hard to visualize, so I'll give an example.  Let's say you
+have the following associations
+
   Album.many_to_one :artist
   Album.one_to_many :tracks
-  Album.eager(:band, :tracks).all
-  # The key_hash provided to the :eager_loader proc would be:
-  {:id=>{1=>[album1], 3=>[album2]}, :artist_id=>{2=>[album1, album2]}}
+    
+and the following three albums in the database:
 
-Using these options, you can build associations that Sequel doesn't natively support,
-and still be able to use the same eager loading features that you are used to.
+  album1 = Album.create(:artist_id=>3) # id: 1
+  album2 = Album.create(:artist_id=>3) # id: 2
+  album3 = Album.create(:artist_id=>2) # id: 3
+
+If you try to eager load this dataset:
+
+  Album.eager(:artist, :tracks).all
+
+Then the id_map provided to the artist :eager_loader proc would be:
+
+  {3=>[album1, album2], 2=>[album3]}
+
+The artist id_map contains a mapping of artist_id values to arrays of
+album objects.  Since both album1 and album2 have the same artist_id,
+the are both in the array related to that key.  album3 has a different
+artist_id, so it is in a different array. Eager loading of artists is
+done by looking for any artist having one of the keys in the hash:
+
+  artists = Artist.where(:id=>id_map.keys).all
+
+When the artists are retrieved, you can iterate over them, find entries
+with matching keys, and manually associate them to the albums:
+
+  artists.each do |artist|
+    # Find related albums using the artist_id_map
+    if albums = id_map[artist.id]
+      # Iterate over the albums
+      albums.each do |album|
+        # Manually set the artist association for each album
+        album.associations[:artist] = artist
+      end
+    end
+  end
+
+The id_map provided to the tracks :eager_loader proc would be:
+
+  {1=>[album1], 2=>[album2], 3=>[album3]}
+
+Now the id_map contains a mapping of id values to arrays of album objects (in this
+case each array only has a single object, because id is the primary key).  So when
+looking for tracks to eagerly load, you only need to look for ones that have an
+album_id with one of the keys in the hash:
+
+  tracks = Track.where(:album_id=>id_map.keys).all
+
+When the tracks are retrieved, you can iterate over them, find entries with matching
+keys, and manually associate them to the albums:
+
+  tracks.each do |track|
+    if albums = id_map[track.album_id]
+      albums.each do |album|
+        album.associations[:tracks] << track
+      end
+    end
+  end
+
+=== Two basic example eager loaders
+
+Putting the code in the above examples together, you almost have enough for a basic
+working eager loader.  The main important thing that is missing is you need to set
+initial values for the eagerly loaded associations.  For the artist association, you
+need to initial the values to nil:
+
+  # rows here is the :rows entry in the hash passed to the eager loader
+  rows.each{|album| album.associations[:artist] = nil}
+  
+For the tracks association, you set the initial value to an empty array:
+
+  rows.each{|album| album.associations[:track] = []}
+
+These are done so that if an album currently being loaded doesn't have an associated
+artist or any associated tracks, the lack of them will be cached, so calling the
+artist or tracks method on the album will not do another database lookup.
+
+So putting everything together, the artist eager loader looks like:
+
+  :eager_loader=>(proc do |eo_opts|
+    eo_opts[:rows].each{|album| album.associations[:artist] = nil}
+    id_map = eo_opts[:id_map]
+    Artist.where(:id=>id_map.keys).all do |artist|
+      if albums = id_map[artist.id]
+        albums.each do |album|
+          album.associations[:artist] = artist
+        end
+      end
+    end
+  end)
+
+and the tracks eager loader looks like:
+
+  :eager_loader=>(proc do |eo_opts|
+    eo_opts[:rows].each{|album| album.associations[:tracks] = []}
+    id_map = eo_opts[:id_map]
+    Track.where(:id=>id_map.keys).all do |tracks|
+      if albums = id_map[track.album_id]
+        albums.each do |album|
+          album.associations[:tracks] << track
+        end
+      end
+    end
+  end)
+
+Now, these are both overly simplistic eager loaders that don't respect cascaded
+associations or any of the association options.  But hopefully they both
+provide simple examples that you can more easily build and learn from, as 
+the custom eager loaders described later in this page are more complex.
+
+Basically, the eager loading steps can be broken down into:
+
+1. Set default association values (nil/[]) for each of the current objects
+2. Return just related associated objects by filtering the associated class
+   to include only rows with keys present in the id_map.
+3. Iterating over the returned associated objects, indexing into the id_map
+   using the foreign/primary key value in the associated object to get
+   current values associated to that specific object.
+4. For each of those current values, updating the cached association value to
+   include that specific object.
+
+Using the :eager_loader proc, you should be able to eagerly load all associations
+that can be eagerly loaded, even if Sequel doesn't natively support such eager
+loading.
 
 == ActiveRecord associations
 
@@ -123,9 +235,9 @@ require different approaches or custom <tt>:eager_loader</tt> options.
 
 === Association callbacks
 
-Sequel supports the same callbacks that ActiveRecord does on +one_to_many+ and
+Sequel supports the same callbacks that ActiveRecord does for +one_to_many+ and
 +many_to_many+ associations: <tt>:before_add</tt>, <tt>:before_remove</tt>, <tt>:after_add</tt>, and
-<tt>:after_remove</tt>. One +many_to_one+ associations and +one_to_one+ associations, Sequel
+<tt>:after_remove</tt>. For +many_to_one+ associations and +one_to_one+ associations, Sequel
 supports the <tt>:before_set</tt> and <tt>:after_set</tt> callbacks.  On all associations,
 Sequel supports <tt>:after_load</tt>, which is called after the association has been
 loaded.
@@ -148,7 +260,7 @@ otherwise modified:
   class Author < Sequel::Model
     one_to_many :authorships
   end
-  Author.first.authorships_dataset.filter{|o| o.number < 10}.first
+  Author.first.authorships_dataset.where{number < 10}.first
  
 You can extend a dataset with a module using the <tt>:extend</tt> association option.  You can reference
 the model object that created the association dataset via the dataset's
@@ -237,6 +349,23 @@ Sequel::Model:
 
   class Invoice < Sequel::Model
     many_to_one :client
+
+    # has_one :through equivalent 1
+    # eager load with :eager=>:firm option on :client association, and eager loading :client
+    def firm
+      client.firm if client
+    end
+
+    # has_one :through equivalent 2
+    # eager load the usual way
+    many_to_many :firms, :join_table=>:clients, :left_key=>:id, :left_primary_key=>:client_id, :right_key=>:firm_id
+    def firm
+      firms.first
+    end
+
+    # has_one :through equivalent 3
+    # eager loading requires custom :eager_loader proc
+    many_to_one :firm, :dataset=>proc{Firm.join(:clients, :firm_id=>:id, :id=>client_id).select_all(:firms)}
   end
 
   Firm.first.invoices
@@ -252,7 +381,7 @@ Polymorphic associations break referential integrity and are significantly more
 complex than non-polymorphic associations, so their use is not recommended unless
 you are stuck with an existing design that uses them.
 
-If you must use them, look for the sequel_polymorphic plugin, as it makes using
+If you must use them, look for the sequel_polymorphic external plugin, as it makes using
 polymorphic associations in Sequel about as easy as it is in ActiveRecord.  However,
 here's how they can be done using Sequel's custom associations (the sequel_polymorphic
 plugin is just a generic version of this code):
@@ -280,7 +409,7 @@ Sequel::Model:
     many_to_one :attachable, :reciprocal=>:assets, \
       :dataset=>(proc do
         klass = attachable_type.constantize
-        klass.filter(klass.primary_key=>attachable_id)
+        klass.where(klass.primary_key=>attachable_id)
       end), \
       :eager_loader=>(proc do |eo|
         id_map = {}
@@ -290,7 +419,7 @@ Sequel::Model:
         end
         id_map.each do |klass_name, id_map|
           klass = klass_name.constantize
-          klass.filter(klass.primary_key=>id_map.keys).all do |attach|
+          klass.where(klass.primary_key=>id_map.keys).all do |attach|
             id_map[attach.pk].each do |asset|
               asset.associations[:attachable] = attach
             end
@@ -307,48 +436,34 @@ Sequel::Model:
   end 
 
   class Post < Sequel::Model
-    one_to_many :assets, :key=>:attachable_id do |ds|
-      ds.filter(:attachable_type=>'Post')
-    end 
+    one_to_many :assets, :key=>:attachable_id, :reciprocal=>:attachable, :conditions=>{:attachable_type=>'Post'}
   
     private
 
     def _add_asset(asset)
-      asset.attachable_id = pk
-      asset.attachable_type = 'Post'
-      asset.save
-    end 
+      asset.update(:attachable_id=>pk, :attachable_type=>'Post')
+    end
     def _remove_asset(asset)
-      asset.attachable_id = nil 
-      asset.attachable_type = nil 
-      asset.save
-    end 
+      asset.update(:attachable_id=>nil, :attachable_type=>nil)
+    end
     def _remove_all_assets
-      Asset.filter(:attachable_id=>pk, :attachable_type=>'Post')\
-        .update(:attachable_id=>nil, :attachable_type=>nil)
+      assets_dataset.update(:attachable_id=>nil, :attachable_type=>nil)
     end
   end
 
   class Note < Sequel::Model
-    one_to_many :assets, :key=>:attachable_id do |ds|
-      ds.filter(:attachable_type=>'Note')
-    end
+    one_to_many :assets, :key=>:attachable_id, :reciprocal=>:attachable, :conditions=>{:attachable_type=>'Note'}     
 
     private
 
     def _add_asset(asset)
-      asset.attachable_id = pk
-      asset.attachable_type = 'Note'
-      asset.save
+      asset.update(:attachable_id=>pk, :attachable_type=>'Note')
     end
     def _remove_asset(asset)
-      asset.attachable_id = nil
-      asset.attachable_type = nil
-      asset.save
+      asset.update(:attachable_id=>nil, :attachable_type=>nil)
     end
     def _remove_all_assets
-      Asset.filter(:attachable_id=>pk, :attachable_type=>'Note')\
-        .update(:attachable_id=>nil, :attachable_type=>nil)
+      assets_dataset.update(:attachable_id=>nil, :attachable_type=>nil)
     end
   end
 
@@ -390,7 +505,7 @@ node.children.  You can even eager load the relationship up to a certain depth:
   # Eager load three generations of generations of children for a given node 
   Node.filter(:id=>1).eager(:children=>{:children=>:children}).all.first
   # Load parents and grandparents for a group of nodes
-  Node.filter{|o| o.id < 10}.eager(:parent=>:parent).all
+  Node.filter{id < 10}.eager(:parent=>:parent).all
 
 What if you want to get all ancestors up to the root node, or all descendents,
 without knowing the depth of the tree?
@@ -415,7 +530,7 @@ without knowing the depth of the tree?
         non_root_nodes.each{|n| (id_map[n.parent_id] ||= []) << n}
         # Doesn't cause an infinte loop, because when only the root node
         # is left, this is not called.
-        Node.filter(Node.primary_key=>id_map.keys).eager(:ancestors).all do |node|
+        Node.where(Node.primary_key=>id_map.keys).eager(:ancestors).all do |node|
           # Populate the parent association for each node
           id_map[node.pk].each{|n| n.associations[:parent] = node}
         end 
@@ -433,7 +548,7 @@ without knowing the depth of the tree?
       # if no records are returned.  Exclude id = parent_id to avoid infinite loop
       # if the root note is one of the returned records and it has parent_id = id
       # instead of parent_id = NULL.
-      Node.filter(:parent_id=>id_map.keys).exclude(:id=>:parent_id).eager(:descendants).all do |node|
+      Node.where(:parent_id=>id_map.keys).exclude(:id=>:parent_id).eager(:descendants).all do |node|
         # Get the parent from the identity map
         parent = id_map[node.parent_id]
         # Set the child's parent association to the parent 
@@ -456,7 +571,7 @@ this easy:
 
 === Joining multiple keys to a single key, through a third table
 
-Let's say you have a database, of songs, lyrics, and artists.  Each song
+Let's say you have a database of songs, lyrics, and artists.  Each song
 may or may not have a lyric (most songs are instrumental).  The lyric can be
 associated to an artist in each of four ways: composer, arranger, vocalist,
 or lyricist.  These may all be the same, or they could all be different, and
@@ -469,14 +584,15 @@ name, with no duplicates?
 
   class Artist < Sequel::Model
     one_to_many :songs, :order=>:songs__name, \
-      :dataset=>proc{Song.select(:songs.*).join(Lyric, :id=>:lyric_id, id=>[:composer_id, :arranger_id, :vocalist_id, :lyricist_id])}, \
+      :dataset=>proc{Song.select_all(:songs).join(Lyric, :id=>:lyric_id, id=>[:composer_id, :arranger_id, :vocalist_id, :lyricist_id])}, \
       :eager_loader=>(proc do |eo|
-        h = eo[:key_hash][:id]
+        h = eo[:id_map]
         ids = h.keys
         eo[:rows].each{|r| r.associations[:songs] = []}
-        Song.select(:songs.*, :lyrics__composer_id, :lyrics__arranger_id, :lyrics__vocalist_id, :lyrics__lyricist_id)\
-         .join(Lyric, :id=>:lyric_id){{:composer_id=>ids, :arranger_id=>ids, :vocalist_id=>ids, :lyricist_id=>ids}.sql_or}\
-         .order(:songs__name).all do |song|
+        Song.select_all(:songs).
+          select_append(:lyrics__composer_id, :lyrics__arranger_id, :lyrics__vocalist_id, :lyrics__lyricist_id).
+          join(Lyric, :id=>:lyric_id){Sequel.or(:composer_id=>ids, :arranger_id=>ids, :vocalist_id=>ids, :lyricist_id=>ids)}.
+          order(:songs__name).all do |song|
           [:composer_id, :arranger_id, :vocalist_id, :lyricist_id].each do |x|
             recs = h[song.values.delete(x)]
             recs.each{|r| r.associations[:songs] << song} if recs
@@ -499,14 +615,14 @@ associated tickets.
   class Project < Sequel::Model
     one_to_many :tickets
     many_to_one :ticket_hours, :read_only=>true, :key=>:id,
-     :dataset=>proc{Ticket.filter(:project_id=>id).select{sum(hours).as(hours)}},
+     :dataset=>proc{Ticket.where(:project_id=>id).select{sum(hours).as(hours)}},
      :eager_loader=>(proc do |eo|
       eo[:rows].each{|p| p.associations[:ticket_hours] = nil}
-      Ticket.filter(:project_id=>eo[:key_hash][:id].keys).
-       group(:project_id).
-       select{[project_id, sum(hours).as(hours)]}.
+      Ticket.where(:project_id=>eo[:id_map].keys).
+       select_group(:project_id).
+       select_append{sum(hours).as(hours)}.
        all do |t|
-        p = eo[:key_hash][:id][t.values.delete(:project_id)].first
+        p = eo[:id_map][t.values.delete(:project_id)].first
         p.associations[:ticket_hours] = t
        end
      end)
@@ -525,6 +641,4 @@ associated tickets.
   end
 
 Note that it is often better to use a sum cache instead of this approach.  You can implement
-a sum cache using +after_create+ and +after_delete+ hooks, or using a database trigger
-(the preferred method if you only have to support one database and that database supports
-triggers).
+a sum cache using +after_create+ and +after_delete+ hooks, or preferrably using a database trigger.

@@ -6,6 +6,17 @@ module Sequel
     # prepared statements and stored procedures.
     module PreparedStatements
       module DatabaseMethods
+        disconnect_errors = <<-END.split("\n").map{|l| l.strip}
+        Commands out of sync; you can't run this command now
+        Can't connect to local MySQL server through socket
+        MySQL server has gone away
+        Lost connection to MySQL server during query
+        This connection is still waiting for a result, try again once you have the result
+        closed MySQL connection
+        END
+        # Error messages for mysql and mysql2 that indicate the current connection should be disconnected
+        MYSQL_DATABASE_DISCONNECT_ERRORS = /\A#{Regexp.union(disconnect_errors)}/o
+       
         # Support stored procedures on MySQL
         def call_sproc(name, opts={}, &block)
           args = opts[:args] || [] 
@@ -41,15 +52,16 @@ module Sequel
         # arguments.
         def execute_prepared_statement(ps_name, opts, &block)
           args = opts[:arguments]
-          ps = prepared_statements[ps_name]
+          ps = prepared_statement(ps_name)
           sql = ps.prepared_sql
           synchronize(opts[:server]) do |conn|
             unless conn.prepared_statements[ps_name] == sql
-              conn.prepared_statements[ps_name] = sql
               _execute(conn, "PREPARE #{ps_name} FROM #{literal(sql)}", opts)
+              conn.prepared_statements[ps_name] = sql
             end
             i = 0
             _execute(conn, "SET " + args.map {|arg| "@sequel_arg_#{i+=1} = #{literal(arg)}"}.join(", "), opts) unless args.empty?
+            opts = opts.merge(:log_sql=>" (#{sql})") if ps.log_sql
             _execute(conn, "EXECUTE #{ps_name}#{" USING #{(1..i).map{|j| "@sequel_arg_#{j}"}.join(', ')}" unless i == 0}", opts, &block)
           end
         end
@@ -94,6 +106,11 @@ module Sequel
           def execute_dui(sql, opts={}, &block)
             super(prepared_statement_name, {:arguments=>bind_arguments}.merge(opts), &block)
           end
+          
+          # Same as execute, explicit due to intricacies of alias and super.
+          def execute_insert(sql, opts={}, &block)
+            super(prepared_statement_name, {:arguments=>bind_arguments}.merge(opts), &block)
+          end
         end
         
         # Methods for MySQL stored procedures using the native driver.
@@ -131,7 +148,7 @@ module Sequel
           ps.extend(PreparedStatementMethods)
           if name
             ps.prepared_statement_name = name
-            db.prepared_statements[name] = ps
+            db.set_prepared_statement(name, ps)
           end
           ps
         end

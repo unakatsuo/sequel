@@ -2,10 +2,10 @@ require File.join(File.dirname(File.expand_path(__FILE__)), 'spec_helper.rb')
 
 describe Sequel::Database do
   specify "should provide disconnect functionality" do
-    INTEGRATION_DB.test_connection
-    INTEGRATION_DB.pool.size.should == 1
     INTEGRATION_DB.disconnect
     INTEGRATION_DB.pool.size.should == 0
+    INTEGRATION_DB.test_connection
+    INTEGRATION_DB.pool.size.should == 1
   end
 
   specify "should provide disconnect functionality after preparing a statement" do
@@ -13,7 +13,7 @@ describe Sequel::Database do
     INTEGRATION_DB[:items].prepare(:first, :a).call
     INTEGRATION_DB.disconnect
     INTEGRATION_DB.pool.size.should == 0
-    INTEGRATION_DB.drop_table(:items) rescue nil
+    INTEGRATION_DB.drop_table?(:items)
   end
 
   specify "should raise Sequel::DatabaseError on invalid SQL" do
@@ -24,7 +24,11 @@ describe Sequel::Database do
     begin
       INTEGRATION_DB << "SELECT"
     rescue Sequel::DatabaseError=>e
-      e.wrapped_exception.should be_a_kind_of(Exception)
+      if defined?(Java::JavaLang::Exception)
+        (e.wrapped_exception.is_a?(Exception) || e.wrapped_exception.is_a?(Java::JavaLang::Exception)).should be_true
+      else
+        e.wrapped_exception.should be_a_kind_of(Exception)
+      end
     end
   end
 

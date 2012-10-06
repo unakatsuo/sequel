@@ -39,14 +39,15 @@ module Sequel
       :mysql=>proc do |db|
         Sequel.ts_require 'adapters/jdbc/mysql'
         db.extend(Sequel::JDBC::MySQL::DatabaseMethods)
-        db.dataset_class = Sequel::JDBC::MySQL::Dataset
+        db.extend_datasets Sequel::MySQL::DatasetMethods
         JDBC.load_gem('mysql')
         com.mysql.jdbc.Driver
       end,
       :sqlite=>proc do |db|
         Sequel.ts_require 'adapters/jdbc/sqlite'
         db.extend(Sequel::JDBC::SQLite::DatabaseMethods)
-        db.dataset_class = Sequel::JDBC::SQLite::Dataset
+        db.extend_datasets Sequel::SQLite::DatasetMethods
+        db.set_integer_booleans
         JDBC.load_gem('sqlite3')
         org.sqlite.JDBC
       end,
@@ -59,7 +60,7 @@ module Sequel
       :sqlserver=>proc do |db|
         Sequel.ts_require 'adapters/jdbc/sqlserver'
         db.extend(Sequel::JDBC::SQLServer::DatabaseMethods)
-        db.dataset_class = Sequel::JDBC::SQLServer::Dataset
+        db.extend_datasets Sequel::MSSQL::DatasetMethods
         db.send(:set_mssql_unicode_strings)
         com.microsoft.sqlserver.jdbc.SQLServerDriver
       end,
@@ -101,7 +102,7 @@ module Sequel
       :"informix-sqli"=>proc do |db|
         Sequel.ts_require 'adapters/jdbc/informix'
         db.extend(Sequel::JDBC::Informix::DatabaseMethods)
-        db.dataset_class = Sequel::JDBC::Informix::Dataset
+        db.extend_datasets Sequel::Informix::DatasetMethods
         com.informix.jdbc.IfxDriver
       end,
       :db2=>proc do |db|
@@ -113,8 +114,20 @@ module Sequel
       :firebirdsql=>proc do |db|
         Sequel.ts_require 'adapters/jdbc/firebird'
         db.extend(Sequel::JDBC::Firebird::DatabaseMethods)
-        db.dataset_class = Sequel::JDBC::Firebird::Dataset
+        db.extend_datasets Sequel::Firebird::DatasetMethods
         org.firebirdsql.jdbc.FBDriver
+      end,
+      :jdbcprogress=>proc do |db|
+        Sequel.ts_require 'adapters/jdbc/progress'
+        db.extend(Sequel::JDBC::Progress::DatabaseMethods)
+        db.extend_datasets Sequel::Progress::DatasetMethods
+        com.progress.sql.jdbc.JdbcProgressDriver
+      end,
+      :cubrid=>proc do |db|
+        Sequel.ts_require 'adapters/jdbc/cubrid'
+        db.extend(Sequel::JDBC::Cubrid::DatabaseMethods)
+        db.extend_datasets Sequel::Cubrid::DatasetMethods
+        Java::cubrid.jdbc.driver.CUBRIDDriver
       end
     }
     
@@ -150,6 +163,8 @@ module Sequel
       # uri, since JDBC requires one.
       def initialize(opts)
         super
+        @connection_prepared_statements = {}
+        @connection_prepared_statements_mutex = Mutex.new
         @convert_types = typecast_value_boolean(@opts.fetch(:convert_types, true))
         raise(Error, "No connection string specified") unless uri
         
@@ -202,7 +217,7 @@ module Sequel
           begin
             JavaSQL::DriverManager.setLoginTimeout(opts[:login_timeout]) if opts[:login_timeout]
             JavaSQL::DriverManager.getConnection(*args)
-          rescue => e
+          rescue JavaSQL::SQLException, NativeException, StandardError => e
             raise e unless driver
             # If the DriverManager can't get the connection - use the connect
             # method of the driver. (This happens under Tomcat for instance)
@@ -213,8 +228,10 @@ module Sequel
             end
             opts[:jdbc_properties].each{|k,v| props.setProperty(k.to_s, v)} if opts[:jdbc_properties]
             begin
-              driver.new.connect(args[0], props)
-            rescue => e2
+              c = driver.new.connect(args[0], props)
+              raise(Sequel::DatabaseError, 'driver.new.connect returned nil: probably bad JDBC connection string') unless c
+              c
+            rescue JavaSQL::SQLException, NativeException, StandardError => e2
               e.message << "\n#{e2.class.name}: #{e2.message}"
               raise e
             end
@@ -237,13 +254,7 @@ module Sequel
               when :ddl
                 log_yield(sql){stmt.execute(sql)}
               when :insert
-                log_yield(sql) do
-                  if requires_return_generated_keys?
-                    stmt.executeUpdate(sql, JavaSQL::Statement.RETURN_GENERATED_KEYS)
-                  else
-                    stmt.executeUpdate(sql)
-                  end
-                end
+                log_yield(sql){execute_statement_insert(stmt, sql)}
                 last_insert_id(conn, opts.merge(:stmt=>stmt))
               else
                 log_yield(sql){stmt.executeUpdate(sql)}
@@ -253,7 +264,7 @@ module Sequel
         end
       end
       alias execute_dui execute
-      
+
       # Execute the given DDL SQL, which should not return any
       # values or rows.
       def execute_ddl(sql, opts={})
@@ -311,8 +322,15 @@ module Sequel
 
       private
          
-      # Close given adapter connections
+      # Yield the native prepared statements hash for the given connection
+      # to the block in a thread-safe manner.
+      def cps_sync(conn, &block)
+        @connection_prepared_statements_mutex.synchronize{yield(@connection_prepared_statements[conn] ||= {})}
+      end
+
+      # Close given adapter connections, and delete any related prepared statements.
       def disconnect_connection(c)
+        @connection_prepared_statements_mutex.synchronize{@connection_prepared_statements.delete(c)}
         c.close
       end
       
@@ -335,20 +353,25 @@ module Sequel
           ps = name
           name = ps.prepared_statement_name
         else
-          ps = prepared_statements[name]
+          ps = prepared_statement(name)
         end
         sql = ps.prepared_sql
         synchronize(opts[:server]) do |conn|
-          if name and cps = conn.prepared_statements[name] and cps[0] == sql
+          if name and cps = cps_sync(conn){|cpsh| cpsh[name]} and cps[0] == sql
             cps = cps[1]
           else
-            log_yield("Closing #{name}"){cps[1].close} if cps
-            cps = log_yield("Preparing#{" #{name}:" if name} #{sql}"){conn.prepareStatement(sql)}
-            conn.prepared_statements[name] = [sql, cps] if name
+            log_yield("CLOSE #{name}"){cps[1].close} if cps
+            cps = log_yield("PREPARE#{" #{name}:" if name} #{sql}"){prepare_jdbc_statement(conn, sql, opts)}
+            cps_sync(conn){|cpsh| cpsh[name] = [sql, cps]} if name
           end
           i = 0
           args.each{|arg| set_ps_arg(cps, arg, i+=1)}
-          msg = "Executing#{" #{name}" if name}"
+          msg = "EXECUTE#{" #{name}" if name}"
+          if ps.log_sql
+            msg << " ("
+            msg << sql
+            msg << ")"
+          end
           begin
             if block_given?
               yield log_yield(msg, args){cps.executeQuery}
@@ -357,8 +380,8 @@ module Sequel
               when :ddl
                 log_yield(msg, args){cps.execute}
               when :insert
-                log_yield(msg, args){cps.executeUpdate}
-                last_insert_id(conn, opts.merge(:prepared=>true))
+                log_yield(msg, args){execute_prepared_statement_insert(cps)}
+                last_insert_id(conn, opts.merge(:prepared=>true, :stmt=>cps))
               else
                 log_yield(msg, args){cps.executeUpdate}
               end
@@ -371,6 +394,16 @@ module Sequel
         end
       end
 
+      # Execute the prepared insert statement
+      def execute_prepared_statement_insert(stmt)
+        stmt.executeUpdate
+      end
+      
+      # Execute the insert SQL using the statement
+      def execute_statement_insert(stmt, sql)
+        stmt.executeUpdate(sql)
+      end
+      
       # Gets the connection from JNDI.
       def get_connection_from_jndi
         jndi_name = JNDI_URI_REGEXP.match(uri)[1]
@@ -408,7 +441,8 @@ module Sequel
       # Support fractional seconds for Time objects used in bound variables
       def java_sql_timestamp(time)
         ts = java.sql.Timestamp.new(time.to_i * 1000)
-        ts.setNanos(RUBY_VERSION >= '1.9.0' ? time.nsec : time.usec * 1000)
+        # Work around jruby 1.6 ruby 1.9 mode bug
+        ts.setNanos((RUBY_VERSION >= '1.9.0' && time.nsec != 0) ? time.nsec : time.usec * 1000)
         ts
       end 
       
@@ -437,6 +471,11 @@ module Sequel
         end
       end
 
+      # Created a JDBC prepared statement on the connection with the given SQL.
+      def prepare_jdbc_statement(conn, sql, opts)
+        conn.prepareStatement(sql)
+      end
+
       # Java being java, you need to specify the type of each argument
       # for the prepared statement, and bind it individually.  This
       # guesses which JDBC method to use, and hopefully JRuby will convert
@@ -454,7 +493,7 @@ module Sequel
         when TrueClass, FalseClass
           cps.setBoolean(i, arg)
         when NilClass
-          cps.setString(i, nil)
+          set_ps_arg_nil(cps, i)
         when DateTime
           cps.setTimestamp(i, java_sql_datetime(arg))
         when Date
@@ -469,15 +508,15 @@ module Sequel
           cps.setObject(i, arg)
         end
       end
+
+      # Use setString with a nil value by default, but this doesn't work on all subadapters.
+      def set_ps_arg_nil(cps, i)
+        cps.setString(i, nil)
+      end
       
-      # Add a prepared_statements accessor to the connection,
-      # and set it to an empty hash.  This is used to store
-      # adapter specific prepared statements.
+      # Return the connection.  Used to do configuration on the
+      # connection object before adding it to the connection pool.
       def setup_connection(conn)
-        class << conn
-          attr_accessor :prepared_statements
-        end
-        conn.prepared_statements = {}
         conn
       end
       
@@ -521,13 +560,6 @@ module Sequel
       ensure
         stmt.close if stmt
       end
-
-      # This method determines whether or not to add
-      # Statement.RETURN_GENERATED_KEYS as an argument when inserting rows.
-      # Sub-adapters that require this should override this method.
-      def requires_return_generated_keys?
-        false
-      end
     end
     
     class Dataset < Sequel::Dataset
@@ -547,17 +579,17 @@ module Sequel
         # Execute the prepared SQL using the stored type and
         # arguments derived from the hash passed to call.
         def execute(sql, opts={}, &block)
-          super(self, {:arguments=>bind_arguments, :type=>sql_query_type}.merge(opts), &block)
+          super(self, {:arguments=>bind_arguments}.merge(opts), &block)
         end
         
         # Same as execute, explicit due to intricacies of alias and super.
         def execute_dui(sql, opts={}, &block)
-          super(self, {:arguments=>bind_arguments, :type=>sql_query_type}.merge(opts), &block)
+          super(self, {:arguments=>bind_arguments}.merge(opts), &block)
         end
         
         # Same as execute, explicit due to intricacies of alias and super.
         def execute_insert(sql, opts={}, &block)
-          super(self, {:arguments=>bind_arguments, :type=>sql_query_type}.merge(opts), &block)
+          super(self, {:arguments=>bind_arguments, :type=>:insert}.merge(opts), &block)
         end
       end
       
@@ -570,17 +602,17 @@ module Sequel
         
         # Execute the database stored procedure with the stored arguments.
         def execute(sql, opts={}, &block)
-          super(@sproc_name, {:args=>@sproc_args, :sproc=>true, :type=>sql_query_type}.merge(opts), &block)
+          super(@sproc_name, {:args=>@sproc_args, :sproc=>true}.merge(opts), &block)
         end
         
         # Same as execute, explicit due to intricacies of alias and super.
         def execute_dui(sql, opts={}, &block)
-          super(@sproc_name, {:args=>@sproc_args, :sproc=>true, :type=>sql_query_type}.merge(opts), &block)
+          super(@sproc_name, {:args=>@sproc_args, :sproc=>true}.merge(opts), &block)
         end
         
         # Same as execute, explicit due to intricacies of alias and super.
         def execute_insert(sql, opts={}, &block)
-          super(@sproc_name, {:args=>@sproc_args, :sproc=>true, :type=>sql_query_type}.merge(opts), &block)
+          super(@sproc_name, {:args=>@sproc_args, :sproc=>true, :type=>:insert}.merge(opts), &block)
         end
       end
       
@@ -602,7 +634,7 @@ module Sequel
         ps.extend(PreparedStatementMethods)
         if name
           ps.prepared_statement_name = name
-          db.prepared_statements[name] = ps
+          db.set_prepared_statement(name, ps)
         end
         ps
       end
@@ -618,16 +650,17 @@ module Sequel
       JAVA_BUFFERED_READER  = Java::JavaIo::BufferedReader
       JAVA_BIG_DECIMAL      = Java::JavaMath::BigDecimal
       JAVA_BYTE_ARRAY       = Java::byte[]
+      JAVA_UUID             = Java::JavaUtil::UUID
 
       # Handle type conversions for common Java types.
       class TYPE_TRANSLATOR
         LF = "\n".freeze
-        def time(v) Sequel.string_to_time(v.to_string) end
+        def time(v) Sequel.string_to_time("#{v.to_string}.#{sprintf('%03i', v.getTime.divmod(1000).last)}") end
         def date(v) Date.civil(v.getYear + 1900, v.getMonth + 1, v.getDate) end
         def decimal(v) BigDecimal.new(v.to_string) end
         def byte_array(v) Sequel::SQL::Blob.new(String.from_java_bytes(v)) end
         def blob(v) Sequel::SQL::Blob.new(String.from_java_bytes(v.getBytes(1, v.length))) end
-        def clob(v) Sequel::SQL::Blob.new(v.getSubString(1, v.length)) end
+        def clob(v) v.getSubString(1, v.length) end
         def buffered_reader(v)
           lines = ""
           c = false
@@ -638,6 +671,7 @@ module Sequel
           end
           lines
         end
+        def uuid(v) v.to_string end
       end
       TYPE_TRANSLATOR_INSTANCE = tt = TYPE_TRANSLATOR.new
 
@@ -650,6 +684,7 @@ module Sequel
       BYTE_ARRAY_METHOD = tt.method(:byte_array)
       BLOB_METHOD = tt.method(:blob)
       CLOB_METHOD = tt.method(:clob)
+      UUID_METHOD = tt.method(:uuid)
 
       # Convert the given Java timestamp to an instance of Sequel.datetime_class.
       def convert_type_timestamp(v)
@@ -677,6 +712,8 @@ module Sequel
           BLOB_METHOD
         when JAVA_SQL_CLOB
           CLOB_METHOD
+        when JAVA_UUID
+          UUID_METHOD
         else
           false
         end

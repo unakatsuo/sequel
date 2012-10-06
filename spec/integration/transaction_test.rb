@@ -3,15 +3,14 @@ require File.join(File.dirname(File.expand_path(__FILE__)), 'spec_helper.rb')
 describe "Database transactions" do
   before(:all) do
     @db = INTEGRATION_DB
-    @db.drop_table(:items) if @db.table_exists?(:items)
-    @db.create_table(:items, :engine=>'InnoDB'){String :name; Integer :value}
+    @db.create_table!(:items, :engine=>'InnoDB'){String :name; Integer :value}
     @d = @db[:items]
   end
   before do
     @d.delete
   end
   after(:all) do
-    @db.drop_table(:items) if @db.table_exists?(:items)
+    @db.drop_table?(:items)
   end
 
   specify "should support transactions" do
@@ -134,6 +133,16 @@ describe "Database transactions" do
   end
 
   if INTEGRATION_DB.supports_prepared_transactions?
+    specify "should allow saving and destroying of model objects" do
+      c = Class.new(Sequel::Model(@d))
+      c.set_primary_key :name
+      c.unrestrict_primary_key
+      c.use_after_commit_rollback = false
+      @db.transaction(:prepare=>'XYZ'){c.create(:name => '1'); c.create(:name => '2').destroy}
+      @db.commit_prepared_transaction('XYZ')
+      @d.select_order_map(:name).should == ['1']
+    end
+
     specify "should commit prepared transactions using commit_prepared_transaction" do
       @db.transaction(:prepare=>'XYZ'){@d << {:name => '1'}}
       @db.commit_prepared_transaction('XYZ')
@@ -146,7 +155,7 @@ describe "Database transactions" do
       @d.select_order_map(:name).should == []
     end
 
-    if INTEGRATION_DB.supports_savepoints?
+    if INTEGRATION_DB.supports_savepoints_in_prepared_transactions?
       specify "should support savepoints when using prepared transactions" do
         @db.transaction(:prepare=>'XYZ'){@db.transaction(:savepoint=>true){@d << {:name => '1'}}}
         @db.commit_prepared_transaction('XYZ')
@@ -242,7 +251,7 @@ describe "Database transactions" do
       proc{@db.transaction(:prepare=>'XYZ'){@db.after_rollback{}}}.should raise_error(Sequel::Error)
     end
 
-    if INTEGRATION_DB.supports_savepoints?
+    if INTEGRATION_DB.supports_savepoints_in_prepared_transactions?
       specify "should raise an error if you attempt to use after_commit or after rollback inside a savepoint in a prepared transaction" do
         proc{@db.transaction(:prepare=>'XYZ'){@db.transaction(:savepoint=>true){@db.after_commit{}}}}.should raise_error(Sequel::Error)
         proc{@db.transaction(:prepare=>'XYZ'){@db.transaction(:savepoint=>true){@db.after_rollback{}}}}.should raise_error(Sequel::Error)
@@ -255,12 +264,11 @@ if (! defined?(RUBY_ENGINE) or RUBY_ENGINE == 'ruby' or (RUBY_ENGINE == 'rbx' &&
   describe "Database transactions and Thread#kill" do
     before do
       @db = INTEGRATION_DB
-      @db.drop_table(:items) if @db.table_exists?(:items)
-      @db.create_table(:items, :engine=>'InnoDB'){String :name; Integer :value}
+      @db.create_table!(:items, :engine=>'InnoDB'){String :name; Integer :value}
       @d = @db[:items]
     end
     after do
-      @db.drop_table(:items) if @db.table_exists?(:items)
+      @db.drop_table?(:items)
     end
 
     specify "should handle transactions inside threads" do

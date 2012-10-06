@@ -1,8 +1,11 @@
 # Adds the Sequel::Migration and Sequel::Migrator classes, which allow
 # the user to easily group schema changes and migrate the database
 # to a newer version or revert to a previous version.
-
 #
+# To load the extension:
+#
+#   Sequel.extension :migration
+
 module Sequel
   # Sequel's older migration class, available for backward compatibility.
   # Uses subclasses with up and down instance methods for each migration:
@@ -22,7 +25,7 @@ module Sequel
   #
   # Part of the +migration+ extension.
   class Migration
-    # Creates a new instance of the migration and sets the @db attribute.
+    # Set the database associated with this migration.
     def initialize(db)
       @db = db
     end
@@ -42,6 +45,11 @@ module Sequel
     # Adds the new migration class to the list of Migration descendants.
     def self.inherited(base)
       descendants << base
+    end
+
+    # Don't allow transaction overriding in old migrations.
+    def self.use_transactions
+      nil
     end
     
     # The default down action does nothing
@@ -68,6 +76,15 @@ module Sequel
 
     # Proc used for the up action
     attr_accessor :up
+
+    # Whether to use transactions for this migration, default depends on the
+    # database.
+    attr_accessor :use_transactions
+
+    # Don't set transaction use by default.
+    def initialize
+      @use_transactions = nil
+    end
 
     # Apply the appropriate block on the +Database+
     # instance using instance_eval.
@@ -98,6 +115,16 @@ module Sequel
     # Defines the migration's down action.
     def down(&block)
       migration.down = block
+    end
+
+    # Disable the use of transactions for the related migration
+    def no_transaction
+      migration.use_transactions = false
+    end
+
+    # Enable the use of transactions for the related migration
+    def transaction
+      migration.use_transactions = true
     end
 
     # Defines the migration's up action.
@@ -164,6 +191,10 @@ module Sequel
 
     def alter_table(table, &block)
       @actions << [:alter_table, table, MigrationAlterTableReverser.new.reverse(&block)]
+    end
+
+    def create_join_table(*args)
+      @actions << [:drop_join_table, *args]
     end
 
     def create_table(*args)
@@ -312,9 +343,26 @@ module Sequel
     class Error < Sequel::Error
     end
 
+    # Exception class raised when Migrator.check_current signals that it is
+    # not current.
+    class NotCurrentError < Error
+    end
+
     # Wrapper for +run+, maintaining backwards API compatibility
     def self.apply(db, directory, target = nil, current = nil)
       run(db, directory, :target => target, :current => current)
+    end
+
+    # Raise a NotCurrentError unless the migrator is current, takes the same
+    # arguments as #run.
+    def self.check_current(*args)
+      raise(NotCurrentError, 'migrator is not current') unless is_current?(*args)
+    end
+
+    # Return whether the migrator is current (i.e. it does not need to make
+    # any changes).  Takes the same arguments as #run.
+    def self.is_current?(db, directory, opts={})
+      migrator_class(directory).new(db, directory, opts).is_current?
     end
 
     # Migrates the supplied database using the migration files in the the specified directory. Options:
@@ -337,11 +385,15 @@ module Sequel
     # if the version number appears to be a unix time integer for a year
     # after 2005, otherwise uses the IntegerMigrator.
     def self.migrator_class(directory)
-      Dir.new(directory).each do |file|
-        next unless MIGRATION_FILE_PATTERN.match(file)
-        return TimestampMigrator if file.split(MIGRATION_SPLITTER, 2).first.to_i > MINIMUM_TIMESTAMP
+      if self.equal?(Migrator)
+        Dir.new(directory).each do |file|
+          next unless MIGRATION_FILE_PATTERN.match(file)
+          return TimestampMigrator if file.split(MIGRATION_SPLITTER, 2).first.to_i > MINIMUM_TIMESTAMP
+        end
+        IntegerMigrator
+      else
+        self
       end
-      IntegerMigrator
     end
     private_class_method :migrator_class
     
@@ -380,9 +432,30 @@ module Sequel
       @table = schema ? Sequel::SQL::QualifiedIdentifier.new(schema, table) : table
       @column = opts[:column] || self.class.const_get(:DEFAULT_SCHEMA_COLUMN)
       @ds = schema_dataset
+      @use_transactions = opts[:use_transactions]
     end
 
     private
+
+    # If transactions should be used for the migration, yield to the block
+    # inside a transaction.  Otherwise, just yield to the block.
+    def checked_transaction(migration, &block)
+      use_trans = if @use_transactions.nil?
+        if migration.use_transactions.nil?
+          @db.supports_transactional_ddl?
+        else
+          migration.use_transactions
+        end
+      else
+        @use_transactions
+      end
+
+      if use_trans
+        db.transaction(&block)
+      else
+        yield
+      end
+    end
 
     # Remove all migration classes.  Done by the migrator to ensure that
     # the correct migration classes are picked up.
@@ -431,13 +504,18 @@ module Sequel
       @migrations = get_migrations
     end
 
+    # The integer migrator is current if the current version is the same as the target version.
+    def is_current?
+      current_migration_version == target
+    end
+    
     # Apply all migrations on the database
     def run
       migrations.zip(version_numbers).each do |m, v|
         t = Time.now
         lv = up? ? v : v + 1
         db.log_info("Begin applying migration version #{lv}, direction: #{direction}")
-        db.transaction do
+        checked_transaction(m) do
           m.apply(db, direction)
           set_migration_version(v)
         end
@@ -461,6 +539,9 @@ module Sequel
       Dir.new(directory).each do |file|
         next unless MIGRATION_FILE_PATTERN.match(file)
         version = migration_version_from_file(file)
+        if version >= 20000101
+          raise Migrator::Error, "Migration number too large, must use TimestampMigrator: #{file}"
+        end
         raise(Error, "Duplicate migration version: #{version}") if files[version]
         files[version] = File.join(directory, file)
       end
@@ -545,12 +626,18 @@ module Sequel
       @migration_tuples = get_migration_tuples
     end
 
+    # The timestamp migrator is current if there are no migrations to apply
+    # in either direction.
+    def is_current?
+      migration_tuples.empty?
+    end
+    
     # Apply all migration tuples on the database
     def run
       migration_tuples.each do |m, f, direction|
         t = Time.now
         db.log_info("Begin applying migration #{f}, direction: #{direction}")
-        db.transaction do
+        checked_transaction(m) do
           m.apply(db, direction)
           fi = f.downcase
           direction == :up ? ds.insert(column=>fi) : ds.filter(column=>fi).delete

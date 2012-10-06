@@ -2,7 +2,7 @@ require 'rubygems'
 require 'logger'
 unless Object.const_defined?('Sequel')
   $:.unshift(File.join(File.dirname(File.expand_path(__FILE__)), "../../lib/"))
-  require 'sequel'
+  require 'sequel/no_core_ext'
 end
 begin
   require File.join(File.dirname(File.dirname(__FILE__)), 'spec_config.rb') unless defined?(INTEGRATION_DB)
@@ -15,6 +15,7 @@ if ENV['SEQUEL_COLUMNS_INTROSPECTION']
 end
 
 Sequel::Model.use_transactions = false
+Sequel::Model.cache_anonymous_models = false
 
 unless defined?(RSpec)
   module Spec::Matchers
@@ -41,7 +42,7 @@ def Sequel.guarded?(*checked)
           return c if c.first == INTEGRATION_DB.adapter_scheme
         when 2
           if c.first.is_a?(Proc)
-            return c if c.first.call(INTEGRATION_DB) && c.last == INTEGRATION_DB.database_type
+            return c if c.last == INTEGRATION_DB.database_type && c.first.call(INTEGRATION_DB)
           elsif c.last.is_a?(Proc)
             return c if c.first == INTEGRATION_DB.adapter_scheme && c.last.call(INTEGRATION_DB)
           else
@@ -68,7 +69,7 @@ end
   
   def self.cspecify(message, *checked, &block)
     if pending = Sequel.guarded?(*checked)
-      specify(message){pending("Not yet working on #{Array(pending).join(', ')}", &block)}
+      specify(message){pending("Not yet working on #{Array(pending).map{|x| x.is_a?(Proc) ? :proc : x}.join(', ')}", &block)}
     else
       specify(message, &block)
     end
@@ -85,7 +86,7 @@ else
   INTEGRATION_DB = Sequel.sqlite
 end
 
-if INTEGRATION_DB.adapter_scheme == :ibmdb
+if INTEGRATION_DB.adapter_scheme == :ibmdb || (INTEGRATION_DB.adapter_scheme == :ado && INTEGRATION_DB.database_type == :access)
   def INTEGRATION_DB.drop_table(*tables)
     super
   rescue Sequel::DatabaseError

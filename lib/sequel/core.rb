@@ -17,19 +17,25 @@
 #
 #   Sequel.sqlite('blog.db'){|db| puts db[:users].count} 
 #
-# You can set the +SEQUEL_NO_CORE_EXTENSIONS+ constant or environment variable to have
-# Sequel not extend the core classes.
+# Sequel currently adds methods to the Array, Hash, String and Symbol classes by
+# default.  You can either require 'sequel/no_core_ext' or set the
+# +SEQUEL_NO_CORE_EXTENSIONS+ constant or environment variable before requiring
+# sequel to have # Sequel not add methods to those classes.
 #
 # For a more expanded introduction, see the {README}[link:files/README_rdoc.html].
 # For a quicker introduction, see the {cheat sheet}[link:files/doc/cheat_sheet_rdoc.html].
 module Sequel
   @convert_two_digit_years = true
   @datetime_class = Time
+  @empty_array_handle_nulls = true
   @virtual_row_instance_eval = true
   @require_thread = nil
   
   # Mutex used to protect file loading/requireing
   @require_mutex = Mutex.new
+  
+  # Whether Sequel is being run in single threaded mode
+  @single_threaded = false
   
   class << self
     # Sequel converts two digit years in <tt>Date</tt>s and <tt>DateTime</tt>s by default,
@@ -54,6 +60,27 @@ module Sequel
     # days on +DateTime+).
     attr_accessor :datetime_class
 
+    # Sets whether or not to attempt to handle NULL values correctly when given
+    # an empty array.  By default:
+    #
+    #   DB[:a].filter(:b=>[])
+    #   # SELECT * FROM a WHERE (b != b)
+    #   DB[:a].exclude(:b=>[])
+    #   # SELECT * FROM a WHERE (b = b)
+    #
+    # However, some databases (e.g. MySQL) will perform very poorly
+    # with this type of query.  You can set this to false to get the
+    # following behavior:
+    #
+    #   DB[:a].filter(:b=>[])
+    #   # SELECT * FROM a WHERE 1 = 0
+    #   DB[:a].exclude(:b=>[])
+    #   # SELECT * FROM a WHERE 1 = 1
+    # 
+    # This may not handle NULLs correctly, but can be much faster on
+    # some databases.
+    attr_accessor :empty_array_handle_nulls
+
     # For backwards compatibility, has no effect.
     attr_accessor :virtual_row_instance_eval
     
@@ -64,6 +91,7 @@ module Sequel
 
     # Make thread safe requiring reentrant to prevent deadlocks.
     def check_requiring_thread
+      return yield if @single_threaded
       t = Thread.current
       return(yield) if @require_thread == t
       @require_mutex.synchronize do
@@ -117,6 +145,12 @@ module Sequel
   # To set up a master/slave or sharded database connection, see the {"Master/Slave Databases and Sharding" guide}[link:files/doc/sharding_rdoc.html].
   def self.connect(*args, &block)
     Database.connect(*args, &block)
+  end
+
+  # Assume the core extensions are not loaded by default, if the core_extensions
+  # extension is loaded, this will be overridden.
+  def self.core_extensions?
+    false
   end
   
   # Convert the +exception+ to the given class.  The given class should be
@@ -182,6 +216,19 @@ module Sequel
   def self.quote_identifiers=(value)
     Database.quote_identifiers = value
   end
+
+  # Convert each item in the array to the correct type, handling multi-dimensional
+  # arrays.  For each element in the array or subarrays, call the converter,
+  # unless the value is nil.
+  def self.recursive_map(array, converter)
+    array.map do |i|
+      if i.is_a?(Array)
+        recursive_map(i, converter)
+      elsif i
+        converter.call(i)
+      end
+    end
+  end
   
   # Require all given +files+ which should be in the same or a subdirectory of
   # this file.  If a +subdir+ is given, assume all +files+ are in that subdir.
@@ -191,14 +238,38 @@ module Sequel
     Array(files).each{|f| super("#{File.dirname(__FILE__).untaint}/#{"#{subdir}/" if subdir}#{f}")}
   end
   
-  # Set whether to set the single threaded mode for all databases by default. By default,
+  # Set whether Sequel is being used in single threaded mode. By default,
   # Sequel uses a thread-safe connection pool, which isn't as fast as the
-  # single threaded connection pool.  If your program will only have one thread,
-  # and speed is a priority, you may want to set this to true:
+  # single threaded connection pool, and also has some additional thread
+  # safety checks.  If your program will only have one thread,
+  # and speed is a priority, you should set this to true:
   #
   #   Sequel.single_threaded = true
   def self.single_threaded=(value)
+    @single_threaded = value
     Database.single_threaded = value
+  end
+
+  COLUMN_REF_RE1 = /\A((?:(?!__).)+)__((?:(?!___).)+)___(.+)\z/.freeze
+  COLUMN_REF_RE2 = /\A((?:(?!___).)+)___(.+)\z/.freeze
+  COLUMN_REF_RE3 = /\A((?:(?!__).)+)__(.+)\z/.freeze
+
+  # Splits the symbol into three parts.  Each part will
+  # either be a string or nil.
+  #
+  # For columns, these parts are the table, column, and alias.
+  # For tables, these parts are the schema, table, and alias.
+  def self.split_symbol(sym)
+    case s = sym.to_s
+    when COLUMN_REF_RE1
+      [$1, $2, $3]
+    when COLUMN_REF_RE2
+      [nil, $1, $2]
+    when COLUMN_REF_RE3
+      [$1, $2, nil]
+    else
+      [nil, s, nil]
+    end
   end
 
   # Converts the given +string+ into a +Date+ object.
@@ -237,6 +308,24 @@ module Sequel
       SQLTime.parse(string)
     rescue => e
       raise convert_exception_class(e, InvalidValue)
+    end
+  end
+
+  if defined?(RUBY_ENGINE) && RUBY_ENGINE != 'ruby'
+    # Mutex used to protect mutable data structures
+    @data_mutex = Mutex.new
+
+    # Unless in single threaded mode, protects access to any mutable
+    # global data structure in Sequel.
+    # Uses a non-reentrant mutex, so calling code should be careful.
+    def self.synchronize(&block)
+      @single_threaded ? yield : @data_mutex.synchronize(&block)
+    end
+  else
+    # Yield directly to the block.  You don't need to synchronize
+    # access on MRI because the GVL makes certain methods atomic.
+    def self.synchronize(&block)
+      yield
     end
   end
 
@@ -334,7 +423,9 @@ module Sequel
   private_class_method :adapter_method, :def_adapter_method
   
   require(%w"metaprogramming sql connection_pool exceptions dataset database timezones ast_transformer version")
-  require('core_sql') if !defined?(::SEQUEL_NO_CORE_EXTENSIONS) && !ENV.has_key?('SEQUEL_NO_CORE_EXTENSIONS')
+  if !defined?(::SEQUEL_NO_CORE_EXTENSIONS) && !ENV.has_key?('SEQUEL_NO_CORE_EXTENSIONS')
+    extension(:core_extensions)
+  end
 
   # Add the database adapter class methods to Sequel via metaprogramming
   def_adapter_method(*Database::ADAPTERS)

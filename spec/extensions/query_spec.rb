@@ -17,6 +17,12 @@ describe "Dataset#query" do
     @d = Sequel::Dataset.new(nil)
   end
   
+  specify "should allow cloning without arguments" do
+    q = @d.query {clone}
+    q.class.should == @d.class
+    q.sql.should == "SELECT *"
+  end
+  
   specify "should support #from" do
     q = @d.query {from :xxx}
     q.class.should == @d.class
@@ -35,13 +41,13 @@ describe "Dataset#query" do
   specify "should support #where" do
     q = @d.query do
       from :zzz
-      where(:x + 2 > :y + 3)
+      where{x + 2 > Sequel.expr(:y) + 3}
     end
     q.class.should == @d.class
     q.sql.should == "SELECT * FROM zzz WHERE ((x + 2) > (y + 3))"
 
     q = @d.from(:zzz).query do
-      where((:x.sql_number > 1) & (:y.sql_number > 2))
+      where{(x > 1) & (Sequel.expr(:y) > 2)}
     end
     q.class.should == @d.class
     q.sql.should == "SELECT * FROM zzz WHERE ((x > 1) AND (y > 2))"
@@ -57,7 +63,7 @@ describe "Dataset#query" do
     q = @d.query do
       from :abc
       group_by :id
-      having(:x.sql_number >= 2)
+      having{x >= 2}
     end
     q.class.should == @d.class
     q.sql.should == "SELECT * FROM abc GROUP BY id HAVING (x >= 2)"

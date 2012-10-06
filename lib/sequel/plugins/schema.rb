@@ -29,7 +29,7 @@ module Sequel
         # Drops the table if it exists and then runs create_table.  Should probably
         # not be used except in testing.
         def create_table!(*args, &block)
-          drop_table rescue nil
+          drop_table?
           create_table(*args, &block)
         end
 
@@ -38,9 +38,14 @@ module Sequel
           create_table(*args, &block) unless table_exists?
         end
         
-        # Drops table.
+        # Drops table.  If the table doesn't exist, this will probably raise an error.
         def drop_table
           db.drop_table(table_name)
+        end
+    
+        # Drops table if it already exists, do nothing if it doesn't exist.
+        def drop_table?
+          db.drop_table?(table_name)
         end
     
         # Returns table schema created with set_schema for direct descendant of Model.
@@ -61,7 +66,7 @@ module Sequel
         # test code or simple examples.
         def set_schema(name = nil, &block)
           set_dataset(db[name]) if name
-          @schema = Sequel::Schema::Generator.new(db, &block)
+          @schema = db.create_table_generator(&block)
           set_primary_key(@schema.primary_key_name) if @schema.primary_key_name
         end
         

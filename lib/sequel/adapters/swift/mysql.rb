@@ -1,3 +1,4 @@
+require 'swift/db/mysql'
 Sequel.require 'adapters/shared/mysql'
 
 module Sequel
@@ -21,13 +22,10 @@ module Sequel
           db_type == 'tinyint(1)' ? :boolean : super
         end
       
-        # By default, MySQL 'where id is null' selects the last inserted id.
-        # Turn that off unless explicitly enabled.
+        # Apply the connectiong setting SQLs for every new connection.
         def setup_connection(conn)
+          mysql_connection_setting_sqls.each{|sql| log_yield(sql){conn.execute(sql)}}
           super
-          sql = "SET SQL_AUTO_IS_NULL=0"
-          log_yield(sql){conn.execute(sql)} unless opts[:auto_is_null]
-          conn
         end
       end
       
@@ -35,11 +33,6 @@ module Sequel
       class Dataset < Swift::Dataset
         include Sequel::MySQL::DatasetMethods
         APOS = Dataset::APOS
-        
-        # Use execute_insert to execute the replace_sql.
-        def replace(*args)
-          execute_insert(replace_sql(*args))
-        end
         
         private
         

@@ -45,6 +45,23 @@ class Sequel::ShardedThreadedConnectionPool < Sequel::ThreadedConnectionPool
     @allocated[server]
   end
   
+  # Yield all of the available connections, and the ones currently allocated to
+  # this thread.  This will not yield connections currently allocated to other
+  # threads, as it is not safe to operate on them.  This holds the mutex while
+  # it is yielding all of the connections, which means that until
+  # the method's block returns, the pool is locked.
+  def all_connections
+    t = Thread.current
+    sync do
+      @allocated.values.each do |threads|
+        threads.each do |thread, conn|
+          yield conn if t == thread
+        end
+      end
+      @available_connections.values.each{|v| v.each{|c| yield c}}
+    end
+  end
+  
   # An array of connections opened but not currently used, for the given
   # server. Nonexistent servers will return nil. Treat this as read only, do
   # not modify the resulting object.
@@ -94,7 +111,7 @@ class Sequel::ShardedThreadedConnectionPool < Sequel::ThreadedConnectionPool
   # connection can be acquired, a Sequel::PoolTimeout is 
   # raised.
   def hold(server=:default)
-    sync{server = @servers[server]}
+    server = pick_server(server)
     t = Thread.current
     if conn = owned_connection(t, server)
       return yield(conn)
@@ -190,6 +207,11 @@ class Sequel::ShardedThreadedConnectionPool < Sequel::ThreadedConnectionPool
   def owned_connection(thread, server)
     sync{@allocated[server][thread]}
   end
+
+  # If the server given is in the hash, return it, otherwise, return the default server.
+  def pick_server(server)
+    sync{@servers[server]}
+  end
   
   # Releases the connection assigned to the supplied thread and server. If the
   # server or connection given is scheduled for disconnection, remove the
@@ -199,7 +221,16 @@ class Sequel::ShardedThreadedConnectionPool < Sequel::ThreadedConnectionPool
     if @connections_to_remove.include?(conn)
       remove(thread, conn, server)
     else
-      available_connections(server) << allocated(server).delete(thread)
+      conn = allocated(server).delete(thread)
+
+      case @connection_handling
+      when :queue
+        available_connections(server).unshift(conn)
+      when :disconnect
+        @disconnection_proc.call(conn) if @disconnection_proc
+      else
+        available_connections(server) << conn
+      end
     end
   end
 

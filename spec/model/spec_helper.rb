@@ -1,11 +1,7 @@
 require 'rubygems'
-unless Object.const_defined?('Sequel')
+unless Object.const_defined?('Sequel') && Sequel.const_defined?('Model') 
   $:.unshift(File.join(File.dirname(File.expand_path(__FILE__)), "../../lib/"))
-  require 'sequel/core'
-end
-unless Sequel.const_defined?('Model')
-  $:.unshift(File.join(File.dirname(File.expand_path(__FILE__)), "../../lib/"))
-  require 'sequel/model'
+  require 'sequel/no_core_ext'
 end
 
 if ENV['SEQUEL_COLUMNS_INTROSPECTION']
@@ -32,6 +28,7 @@ class << Sequel::Model
 end
 
 Sequel::Model.use_transactions = false
+Sequel::Model.cache_anonymous_models = false
 
 db = Sequel.mock(:fetch=>{:id => 1, :x => 1}, :numrows=>1, :autoid=>proc{|sql| 10})
 def db.schema(*) [[:id, {:primary_key=>true}]] end

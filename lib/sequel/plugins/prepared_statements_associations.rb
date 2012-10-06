@@ -53,8 +53,7 @@ module Sequel
           when :many_to_many
             association_bound_variable_hash(opts.join_table_alias, opts[:left_keys], opts[:left_primary_keys])
           when :many_through_many
-            opts.reverse_edges
-            association_bound_variable_hash(opts[:final_reverse_edge][:alias], Array(opts[:left_key]), opts[:left_primary_keys])
+            association_bound_variable_hash(opts.final_reverse_edge[:alias], Array(opts[:left_key]), opts[:left_primary_keys])
           end
         end
 
@@ -62,7 +61,11 @@ module Sequel
         # that, given appropriate bound variables, the prepared statement will work correctly for any
         # instance.
         def association_prepared_statement(opts)
-          opts[:prepared_statement] ||= _associated_dataset(opts, {}).unbind.first.prepare(opts.returns_array? ? :select : :first, :"smpsap_#{NEXT.call}")
+          opts.send(:cached_fetch, :prepared_statement) do
+            ps = _associated_dataset(opts, {}).unbind.first.prepare(opts.returns_array? ? :select : :first, :"smpsap_#{NEXT.call}")
+            ps.log_sql = true
+            ps
+          end
         end
 
         # If a prepared statement can be used to load the associated objects, execute it to retrieve them.  Otherwise,

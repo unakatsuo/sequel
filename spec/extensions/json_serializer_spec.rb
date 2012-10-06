@@ -1,10 +1,5 @@
 require File.join(File.dirname(File.expand_path(__FILE__)), "spec_helper")
 
-begin
-  require 'json'
-rescue LoadError => e
-  skip_warn "json_serializer plugin: can't load json (#{e.class}: #{e})"
-else
 describe "Sequel::Plugins::JsonSerializer" do
   before do
     class ::Artist < Sequel::Model
@@ -96,6 +91,22 @@ describe "Sequel::Plugins::JsonSerializer" do
     @artist.id.should == 2
   end
 
+  it "should support #from_json to support specific :fields" do
+    @album.from_json('{"name": "AS", "artist_id": 3}', :fields=>['name'])
+    @album.name.should == 'AS'
+    @album.artist_id.should == 2
+  end
+
+  it "should support #from_json to support :missing=>:skip option" do
+    @album.from_json('{"artist_id": 3}', :fields=>['name'], :missing=>:skip)
+    @album.name.should == 'RF'
+    @album.artist_id.should == 2
+  end
+
+  it "should support #from_json to support :missing=>:raise option" do
+    proc{@album.from_json('{"artist_id": 3}', :fields=>['name'], :missing=>:raise)}.should raise_error(Sequel::Error)
+  end
+
   it "should raise an exception for json keys that aren't associations, columns, or setter methods" do
     Album.send(:undef_method, :blah=)
     proc{JSON.parse(@album.to_json(:include=>:blah))}.should raise_error(Sequel::Error)
@@ -114,6 +125,19 @@ describe "Sequel::Plugins::JsonSerializer" do
     ds = Album.dataset.naked
     ds._fetch = {:id=>1, :name=>'RF', :artist_id=>2}
     JSON.parse(ds.to_json).should == [@album.values.inject({}){|h, (k, v)| h[k.to_s] = v; h}]
+  end
+
+  it "should have dataset to_json method respect :array option for the array to use" do
+    a = Album.load(:id=>1, :name=>'RF', :artist_id=>3)
+    JSON.parse(Album.to_json(:array=>[a])).should == [a]
+
+    a.associations[:artist] = artist = Artist.load(:id=>3, :name=>'YJM')
+    JSON.parse(Album.to_json(:array=>[a], :include=>:artist)).first.artist.should == artist
+
+    artist.associations[:albums] = [a]
+    x = JSON.parse(Artist.to_json(:array=>[artist], :include=>:albums))
+    x.should == [artist]
+    x.first.albums.should == [a]
   end
 
   it "should propagate class default options to instance to_json output" do
@@ -136,7 +160,22 @@ describe "Sequel::Plugins::JsonSerializer" do
     @album.to_json(:root=>true, :only => :name).to_s.should == '{"album":{"name":"RF"}}'
   end
   
-  it "should handle the :root option to qualify a dataset of records" do
+  it "should handle the :root=>:both option to qualify a dataset of records" do
+    Album.dataset._fetch = [{:id=>1, :name=>'RF'}, {:id=>1, :name=>'RF'}]
+    Album.dataset.to_json(:root=>true, :only => :id).to_s.should == '{"albums":[{"album":{"id":1}},{"album":{"id":1}}]}'
+  end
+
+  it "should handle the :root=>:collection option to qualify just the collection" do
+    Album.dataset._fetch = [{:id=>1, :name=>'RF'}, {:id=>1, :name=>'RF'}]
+    Album.dataset.to_json(:root=>:collection, :only => :id).to_s.should == '{"albums":[{"id":1},{"id":1}]}'
+  end
+
+  it "should handle the :root=>:instance option to qualify just the instances" do
+    Album.dataset._fetch = [{:id=>1, :name=>'RF'}, {:id=>1, :name=>'RF'}]
+    Album.dataset.to_json(:root=>:instance, :only => :id).to_s.should == '[{"album":{"id":1}},{"album":{"id":1}}]'
+  end
+
+  it "should handle the :root=>true option be the same as :root=>:both for backwards compatibility" do
     Album.dataset._fetch = [{:id=>1, :name=>'RF'}, {:id=>1, :name=>'RF'}]
     Album.dataset.to_json(:root=>true, :only => :id).to_s.should == '{"albums":[{"album":{"id":1}},{"album":{"id":1}}]}'
   end
@@ -160,5 +199,4 @@ describe "Sequel::Plugins::JsonSerializer" do
     Object.send(:remove_const, :Artist2)
     Object.send(:remove_const, :Artist3)
   end
-end
 end

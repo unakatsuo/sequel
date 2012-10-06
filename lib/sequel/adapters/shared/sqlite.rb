@@ -11,6 +11,10 @@ module Sequel
       TEMP_STORE = [:default, :file, :memory].freeze
       VIEWS_FILTER = "type = 'view'".freeze
 
+      # Whether to use integers for booleans in the database.  SQLite recommends
+      # booleans be stored as integers, but historically Sequel has used 't'/'f'.
+      attr_accessor :integer_booleans
+
       # A symbol signifying the value of the auto_vacuum PRAGMA.
       def auto_vacuum
         AUTO_VACUUM[pragma_get(:auto_vacuum).to_i]
@@ -24,12 +28,6 @@ module Sequel
         pragma_set(:auto_vacuum, value)
       end
 
-      # Boolean signifying the value of the case_sensitive_likePRAGMA, or nil
-      # if not using SQLite 3.2.3+.
-      def case_sensitive_like
-        pragma_get(:case_sensitive_like).to_i == 1 if sqlite_version >= 30203
-      end
-      
       # Set the case_sensitive_like PRAGMA using the given boolean value, if using
       # SQLite 3.2.3+.  If not using 3.2.3+, no error is raised. See pragma_set.
       # Consider using the :case_sensitive_like Database option instead.
@@ -55,22 +53,33 @@ module Sequel
         pragma_set(:foreign_keys, !!value ? 'on' : 'off') if sqlite_version >= 30619
       end
 
+      # Return the array of foreign key info hashes using the foreign_key_list PRAGMA,
+      # including information for the :on_update and :on_delete entries.
+      def foreign_key_list(table, opts={})
+        m = output_identifier_meth
+        h = {}
+        metadata_dataset.with_sql("PRAGMA foreign_key_list(?)", input_identifier_meth.call(table)).each do |row|
+          if r = h[row[:id]]
+            r[:columns] << m.call(row[:from])
+            r[:key] << m.call(row[:to]) if r[:key]
+          else
+            h[row[:id]] = {:columns=>[m.call(row[:from])], :table=>m.call(row[:table]), :key=>([m.call(row[:to])] if row[:to]), :on_update=>on_delete_sql_to_sym(row[:on_update]), :on_delete=>on_delete_sql_to_sym(row[:on_delete])}
+          end
+        end
+        h.values
+      end
+
       # Use the index_list and index_info PRAGMAs to determine the indexes on the table.
       def indexes(table, opts={})
         m = output_identifier_meth
         im = input_identifier_meth
         indexes = {}
-        begin
-          metadata_dataset.with_sql("PRAGMA index_list(?)", im.call(table)).each do |r|
-            next if r[:name] =~ PRIMARY_KEY_INDEX_RE
-            indexes[m.call(r[:name])] = {:unique=>r[:unique].to_i==1}
-          end
-        rescue Sequel::DatabaseError
-          nil
-        else
-          indexes.each do |k, v|
-            v[:columns] = metadata_dataset.with_sql("PRAGMA index_info(?)", im.call(k)).map(:name).map{|x| m.call(x)}
-          end
+        metadata_dataset.with_sql("PRAGMA index_list(?)", im.call(table)).each do |r|
+          next if r[:name] =~ PRIMARY_KEY_INDEX_RE
+          indexes[m.call(r[:name])] = {:unique=>r[:unique].to_i==1}
+        end
+        indexes.each do |k, v|
+          v[:columns] = metadata_dataset.with_sql("PRAGMA index_info(?)", im.call(k)).map(:name).map{|x| m.call(x)}
         end
         indexes
       end
@@ -88,6 +97,11 @@ module Sequel
       # an option provided when creating the Database object.
       def pragma_set(name, value)
         execute_ddl("PRAGMA #{name} = #{value}")
+      end
+
+      # Set the integer_booleans option using the passed in :integer_boolean option.
+      def set_integer_booleans
+        @integer_booleans = typecast_value_boolean(@opts[:integer_booleans])
       end
       
       # The version of the server as an integer, where 3.6.19 = 30619.
@@ -170,6 +184,8 @@ module Sequel
       # Run all alter_table commands in a transaction.  This is technically only
       # needed for drop column.
       def apply_alter_table(table, ops)
+        fks = foreign_keys
+        self.foreign_keys = false if fks
         transaction do 
           if ops.length > 1 && ops.all?{|op| op[:op] == :add_constraint}
             # If you are just doing constraints, apply all of them at the same time,
@@ -181,6 +197,7 @@ module Sequel
             ops.each{|op| alter_table_sql_list(table, [op]).flatten.each{|sql| execute_ddl(sql)}}
           end
         end
+        self.foreign_keys = true if fks
       end
 
       # SQLite supports limited table modification.  You can add a column
@@ -208,17 +225,15 @@ module Sequel
         when :set_column_null
           duplicate_table(table){|columns| columns.each{|s| s[:null] = op[:null] if s[:name].to_s == op[:name].to_s}}
         when :set_column_type
-          duplicate_table(table){|columns| columns.each{|s| s[:type] = op[:type] if s[:name].to_s == op[:name].to_s}}
+          duplicate_table(table){|columns| columns.each{|s| s.merge!(op) if s[:name].to_s == op[:name].to_s}}
         when :drop_constraint
           case op[:type]
           when :primary_key
             duplicate_table(table){|columns| columns.each{|s| s[:primary_key] = nil}}
           when :foreign_key
-            duplicate_table(table){|columns| columns.each{|s| s[:table] = nil}}
-          when :unique
-            duplicate_table(table)
+            duplicate_table(table, :no_foreign_keys=>true)
           else
-            raise Error, "Unsupported :type option for drop_constraint: #{op[:type].inspect}"
+            duplicate_table(table)
           end
         when :add_constraint
           duplicate_table(table, :constraints=>[op])
@@ -229,7 +244,7 @@ module Sequel
         end
       end
 
-      # The array of column symbols in the table, except for ones given in opts[:except]
+      # A name to use for the backup table
       def backup_table_name(table, opts={})
         table = table.gsub('`', '')
         (opts[:times]||1000).times do |i|
@@ -238,6 +253,11 @@ module Sequel
         end
       end
 
+      # Surround default with parens to appease SQLite
+      def column_definition_default_sql(sql, column)
+        sql << " DEFAULT (#{literal(column[:default])})" if column.include?(:default)
+      end
+    
       # Array of PRAGMA SQL statements based on the Database options that should be applied to
       # new connections.
       def connection_pragmas
@@ -255,32 +275,12 @@ module Sequel
         ps
       end
 
-      # The array of column schema hashes, except for the ones given in opts[:except]
-      def defined_columns_for(table, opts={})
+      # The array of column schema hashes for the current columns in the table
+      def defined_columns_for(table)
         cols = parse_pragma(table, {})
         cols.each do |c|
           c[:default] = LiteralString.new(c[:default]) if c[:default]
           c[:type] = c[:db_type]
-        end
-        if opts[:except]
-          nono= Array(opts[:except]).compact.map{|n| n.to_s}
-          cols.reject!{|c| nono.include? c[:name] }
-        end
-
-        begin
-          if foreign_keys
-            metadata_dataset.with_sql("PRAGMA foreign_key_list(?)", input_identifier_meth.call(table)).each do |row|
-              c = cols.find {|co| co[:name] == row[:from] } or next
-              c[:table] = row[:table]
-              c[:key] = row[:to]
-              c[:on_update] = on_delete_sql_to_sym(row[:on_update])
-              c[:on_delete] = on_delete_sql_to_sym(row[:on_delete])
-              # is there any way to get deferrable status?
-            end
-          end
-        rescue Sequel::DatabaseError
-          # Doesn't work correctly on some versions of JDBC SQLite,
-          # giving a "query does not return ResultSet" error.
         end
         cols
       end
@@ -302,6 +302,20 @@ module Sequel
         if pks.length > 1
           constraints << {:type=>:primary_key, :columns=>pks}
           def_columns.each{|c| c[:primary_key] = false if c[:primary_key]}
+        end
+
+        # If dropping a foreign key constraint, drop all foreign key constraints,
+        # as there is no way to determine which one to drop.
+        unless opts[:no_foreign_keys]
+          fks = foreign_key_list(table)
+
+          # If dropping a column, if there is a foreign key with that
+          # column, don't include it when building a copy of the table.
+          if ocp = opts[:old_columns_proc]
+            fks.delete_if{|c| ocp.call(c[:columns].dup) != c[:columns]}
+          end
+
+          constraints.concat(fks.each{|h| h[:type] = :foreign_key})
         end
 
         def_columns_str = (def_columns.map{|c| column_definition_sql(c)} + constraints.map{|c| constraint_definition_sql(c)}).join(', ')
@@ -367,7 +381,7 @@ module Sequel
       
       # SQLite treats integer primary keys as autoincrementing (alias of rowid).
       def schema_autoincrementing_primary_key?(schema)
-        super and schema[:db_type].downcase == 'integer'
+        super && schema[:db_type].downcase == 'integer'
       end
 
       # SQLite supports schema parsing using the table_info PRAGMA, so
@@ -384,13 +398,12 @@ module Sequel
         m = output_identifier_meth
         metadata_dataset.from(:sqlite_master).server(opts[:server]).filter(filter).map{|r| m.call(r[:name])}
       end
-      
-      # SQLite uses the integer data type even for bignums.  This is because they
-      # are both stored internally as text, and converted when returned from
-      # the database.  Using an integer type instead of bigint makes it more likely
-      # that software will automatically return the column as an integer.
+
+      # SQLite only supports AUTOINCREMENT on integer columns, not
+      # bigint columns, so use integer instead of bigint for those
+      # columns.
       def type_literal_generic_bignum(column)
-        :integer
+        column[:auto_increment] ? :integer : super
       end
     end
     
@@ -398,6 +411,7 @@ module Sequel
     module DatasetMethods
       SELECT_CLAUSE_METHODS = Dataset.clause_methods(:select, %w'select distinct columns from join where group having compounds order limit')
       CONSTANT_MAP = {:CURRENT_DATE=>"date(CURRENT_TIMESTAMP, 'localtime')".freeze, :CURRENT_TIMESTAMP=>"datetime(CURRENT_TIMESTAMP, 'localtime')".freeze, :CURRENT_TIME=>"time(CURRENT_TIMESTAMP, 'localtime')".freeze}
+      EMULATED_FUNCTION_MAP = {:char_length=>'length'.freeze}
       EXTRACT_MAP = {:year=>"'%Y'", :month=>"'%m'", :day=>"'%d'", :hour=>"'%H'", :minute=>"'%M'", :second=>"'%f'"}
       NOT_SPACE = Dataset::NOT_SPACE
       COMMA = Dataset::COMMA
@@ -405,20 +419,36 @@ module Sequel
       AS = Dataset::AS
       APOS = Dataset::APOS
       EXTRACT_OPEN = "CAST(strftime(".freeze
-      EXRACT_CLOSE = ') AS '.freeze
+      EXTRACT_CLOSE = ') AS '.freeze
       NUMERIC = 'NUMERIC'.freeze
       INTEGER = 'INTEGER'.freeze
       BACKTICK = '`'.freeze
+      BACKTICK_RE = /`/.freeze
+      DOUBLE_BACKTICK = '``'.freeze
       BLOB_START = "X'".freeze
       HSTAR = "H*".freeze
+      DATE_OPEN = "date(".freeze
+      DATETIME_OPEN = "datetime(".freeze
 
-      # SQLite does not support pattern matching via regular expressions.
-      # SQLite is case insensitive (depending on pragma), so use LIKE for
-      # ILIKE.
+      def cast_sql_append(sql, expr, type)
+        if type == Time or type == DateTime
+          sql << DATETIME_OPEN
+          literal_append(sql, expr)
+          sql << PAREN_CLOSE
+        elsif type == Date
+          sql << DATE_OPEN
+          literal_append(sql, expr)
+          sql << PAREN_CLOSE
+        else
+          super
+        end
+      end
+
+      # SQLite is case insensitive (depending on pragma), so use LIKE for ILIKE.
+      # It also doesn't support a NOT LIKE b, you need to use NOT (a LIKE b).
+      # It doesn't support xor or the extract function natively, so those have to be emulated.
       def complex_expression_sql_append(sql, op, args)
         case op
-        when :~, :'!~', :'~*', :'!~*'
-          raise Error, "SQLite does not support pattern matching via regular expressions"
         when :ILIKE
           super(sql, :LIKE, args.map{|a| SQL::Function.new(:upper, a)})
         when :"NOT LIKE", :"NOT ILIKE"
@@ -435,13 +465,14 @@ module Sequel
           raise(Sequel::Error, "unsupported extract argument: #{part.inspect}") unless format = EXTRACT_MAP[part]
           sql << EXTRACT_OPEN << format << COMMA
           literal_append(sql, args.at(1))
-          sql << EXRACT_CLOSE << (part == :second ? NUMERIC : INTEGER) << PAREN_CLOSE
+          sql << EXTRACT_CLOSE << (part == :second ? NUMERIC : INTEGER) << PAREN_CLOSE
         else
           super
         end
       end
       
-      # MSSQL doesn't support the SQL standard CURRENT_DATE or CURRENT_TIME
+      # SQLite has CURRENT_TIMESTAMP and related constants in UTC instead
+      # of in localtime, so convert those constants to local time.
       def constant_sql_append(sql, constant)
         if c = CONSTANT_MAP[constant]
           sql << c
@@ -454,14 +485,19 @@ module Sequel
       # Since we want to always return the count of records, add a condition
       # that is always true and then delete.
       def delete
-        @opts[:where] ? super : filter(1=>1).delete
+        @opts[:where] ? super : where(1=>1).delete
       end
       
       # Return an array of strings specifying a query explanation for a SELECT of the
-      # current dataset.
-      def explain
-        db.send(:metadata_dataset).clone(:sql=>"EXPLAIN #{select_sql}").
-          map{|x| "#{x[:addr]}|#{x[:opcode]}|#{(1..5).map{|i| x[:"p#{i}"]}.join('|')}|#{x[:comment]}"}
+      # current dataset. Currently, the options are ignore, but it accepts options
+      # to be compatible with other adapters.
+      def explain(opts=nil)
+        # Load the PrettyTable class, needed for explain output
+        Sequel.extension(:_pretty_table) unless defined?(Sequel::PrettyTable)
+
+        ds = db.send(:metadata_dataset).clone(:sql=>"EXPLAIN #{select_sql}")
+        rows = ds.all
+        Sequel::PrettyTable.string(rows, ds.columns)
       end
       
       # HAVING requires GROUP BY on SQLite
@@ -472,7 +508,7 @@ module Sequel
       
       # SQLite uses the nonstandard ` (backtick) for quoting identifiers.
       def quoted_identifier_append(sql, c)
-        sql << BACKTICK << c.to_s << BACKTICK
+        sql << BACKTICK << c.to_s.gsub(BACKTICK_RE, DOUBLE_BACKTICK) << BACKTICK
       end
       
       # When a qualified column is selected on SQLite and the qualifier
@@ -539,7 +575,7 @@ module Sequel
           col
         end
       end
-      
+
       # SQL fragment specifying a list of identifiers
       def identifier_list(columns)
         columns.map{|i| quote_identifier(i)}.join(COMMA)
@@ -548,6 +584,16 @@ module Sequel
       # SQLite uses a preceding X for hex escaping strings
       def literal_blob_append(sql, v)
         sql << BLOB_START << v.unpack(HSTAR).first << APOS
+      end
+
+      # Respect the database integer_booleans setting, using 0 or 'f'.
+      def literal_false
+        @db.integer_booleans ? '0' : "'f'"
+      end
+
+      # Respect the database integer_booleans setting, using 1 or 't'.
+      def literal_true
+        @db.integer_booleans ? '1' : "'t'"
       end
 
       # SQLite does not support the SQL WITH clause

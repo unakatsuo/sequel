@@ -12,7 +12,7 @@ describe "Eagerly loading a tree structure" do
       one_to_many :children, :key=>:parent_id
     
       # Only useful when eager loading
-      many_to_one :ancestors, :eager_loader=>(proc do |eo|
+      many_to_one :ancestors, :eager_loader_key=>nil, :eager_loader=>(proc do |eo|
         # Handle cases where the root node has the same parent_id as primary_key
         # and also when it is NULL
         non_root_nodes = eo[:rows].reject do |n| 
@@ -36,7 +36,7 @@ describe "Eagerly loading a tree structure" do
           end
         end
       end)
-      many_to_one :descendants, :eager_loader=>(proc do |eo|
+      many_to_one :descendants, :eager_loader_key=>nil, :eager_loader=>(proc do |eo|
         id_map = {}
         eo[:rows].each do |n|
           # Initialize an empty array of child associations for each parent node
@@ -185,7 +185,7 @@ describe "has_many :through has_many and has_one :through belongs_to" do
           end
         end), \
         :eager_loader=>(proc do |eo|
-          id_map = eo[:key_hash][Firm.primary_key]
+          id_map = eo[:id_map]
           eo[:rows].each{|firm| firm.associations[:invoices] = []}
           Invoice.eager_graph(:client).filter(:client__firm_id=>id_map.keys).all do |inv|
             id_map[inv.client.firm_id].each do |firm|
@@ -333,7 +333,7 @@ describe "Polymorphic Associations" do
       many_to_one :attachable, :reciprocal=>:assets, \
         :dataset=>(proc do
           klass = m.call(attachable_type)
-          klass.filter(klass.primary_key=>attachable_id)
+          klass.where(klass.primary_key=>attachable_id)
         end), \
         :eager_loader=>(proc do |eo|
           id_map = {}
@@ -343,7 +343,7 @@ describe "Polymorphic Associations" do
           end 
           id_map.each do |klass_name, id_map|
             klass = m.call(klass_name)
-            klass.filter(klass.primary_key=>id_map.keys).all do |attach|
+            klass.where(klass.primary_key=>id_map.keys).all do |attach|
               id_map[attach.pk].each do |asset|
                 asset.associations[:attachable] = attach
               end 
@@ -363,25 +363,18 @@ describe "Polymorphic Associations" do
       primary_key :id
     end
     class ::Post < Sequel::Model
-      one_to_many :assets, :key=>:attachable_id, :reciprocal=>:attachable do |ds|
-        ds.filter(:attachable_type=>'Post')
-      end 
+      one_to_many :assets, :key=>:attachable_id, :reciprocal=>:attachable, :conditions=>{:attachable_type=>'Post'}
       
       private
 
       def _add_asset(asset)
-        asset.attachable_id = pk
-        asset.attachable_type = 'Post'
-        asset.save
+        asset.update(:attachable_id=>pk, :attachable_type=>'Post')
       end
       def _remove_asset(asset)
-        asset.attachable_id = nil
-        asset.attachable_type = nil
-        asset.save
+        asset.update(:attachable_id=>nil, :attachable_type=>nil)
       end
       def _remove_all_assets
-        Asset.filter(:attachable_id=>pk, :attachable_type=>'Post')\
-          .update(:attachable_id=>nil, :attachable_type=>nil)
+        assets_dataset.update(:attachable_id=>nil, :attachable_type=>nil)
       end
     end 
   
@@ -389,25 +382,18 @@ describe "Polymorphic Associations" do
       primary_key :id
     end
     class ::Note < Sequel::Model
-      one_to_many :assets, :key=>:attachable_id, :reciprocal=>:attachable do |ds|
-        ds.filter(:attachable_type=>'Note')
-      end 
-      
+      one_to_many :assets, :key=>:attachable_id, :reciprocal=>:attachable, :conditions=>{:attachable_type=>'Note'}     
+
       private
 
       def _add_asset(asset)
-        asset.attachable_id = pk
-        asset.attachable_type = 'Note'
-        asset.save
+        asset.update(:attachable_id=>pk, :attachable_type=>'Note')
       end
       def _remove_asset(asset)
-        asset.attachable_id = nil
-        asset.attachable_type = nil
-        asset.save
+        asset.update(:attachable_id=>nil, :attachable_type=>nil)
       end
       def _remove_all_assets
-        Asset.filter(:attachable_id=>pk, :attachable_type=>'Note')\
-          .update(:attachable_id=>nil, :attachable_type=>nil)
+        assets_dataset.update(:attachable_id=>nil, :attachable_type=>nil)
       end
     end
   end
@@ -526,7 +512,7 @@ describe "many_to_one/one_to_many not referencing primary key" do
       many_to_one :client, :key=>:client_name, \
         :dataset=>proc{Client.filter(:name=>client_name)}, \
         :eager_loader=>(proc do |eo|
-          id_map = eo[:key_hash][:client_name]
+          id_map = eo[:id_map]
           eo[:rows].each{|inv| inv.associations[:client] = nil}
           Client.filter(:name=>id_map.keys).all do |client|
             id_map[client.name].each{|inv| inv.associations[:client] = client}
@@ -629,11 +615,11 @@ describe "statistics associations" do
        :dataset=>proc{Ticket.filter(:project_id=>id).select{sum(hours).as(hours)}},
        :eager_loader=>(proc do |eo|
         eo[:rows].each{|p| p.associations[:ticket_hours] = nil}
-        Ticket.filter(:project_id=>eo[:key_hash][:id].keys).
-         group(:project_id).
-         select{[project_id.as(project_id), sum(hours).as(hours)]}.
+        Ticket.filter(:project_id=>eo[:id_map].keys).
+         select_group(:project_id).
+         select_append{sum(hours).as(hours)}.
          all do |t|
-          p = eo[:key_hash][:id][t.values.delete(:project_id)].first
+          p = eo[:id_map][t.values.delete(:project_id)].first
           p.associations[:ticket_hours] = t
          end
        end)  

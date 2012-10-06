@@ -187,7 +187,7 @@ describe "A connection pool with a max size of 1" do
     q.push nil
     q1.pop
 
-    t1.should_not be_alive
+    t1.join
     t2.should be_alive
     
     c2.should == 'hello'
@@ -228,6 +228,45 @@ describe "A connection pool with a max size of 1" do
 end
 
 shared_examples_for "A threaded connection pool" do  
+  specify "should not have all_connections yield connections allocated to other threads" do
+    pool = Sequel::ConnectionPool.get_pool(@cp_opts.merge(:max_connections=>2, :pool_timeout=>0)) {@invoked_count += 1}
+    q, q1 = Queue.new, Queue.new
+    t = Thread.new do
+      pool.hold do |c1|
+        q1.push nil
+        q.pop
+      end
+    end
+    pool.hold do |c1|
+      q1.pop
+      pool.all_connections{|c| c.should == c1}
+      q.push nil
+    end
+    t.join
+  end
+
+  specify "should not have all_connections yield all available connections" do
+    pool = Sequel::ConnectionPool.get_pool(@cp_opts.merge(:max_connections=>2, :pool_timeout=>0)){@invoked_count += 1}
+    q, q1 = Queue.new, Queue.new
+    b = []
+    t = Thread.new do
+      pool.hold do |c1|
+        b << c1
+        q1.push nil
+        q.pop
+      end
+    end
+    pool.hold do |c1|
+      q1.pop
+      b << c1
+      q.push nil
+    end
+    t.join
+    a = []
+    pool.all_connections{|c| a << c}
+    a.sort.should == b.sort
+  end
+
   specify "should raise a PoolTimeout error if a connection couldn't be acquired before timeout" do
     x = nil
     q, q1 = Queue.new, Queue.new
@@ -301,6 +340,53 @@ shared_examples_for "A threaded connection pool" do
     @pool.available_connections.size.should == 5
     @pool.allocated.should be_empty
   end
+
+  specify "should store connections in a stack by default" do
+    c2 = nil
+    c = @pool.hold{|cc| Thread.new{@pool.hold{|cc2| c2 = cc2}}.join; cc}
+    @pool.size.should == 2
+    @pool.hold{|cc| cc.should == c}
+    @pool.hold{|cc| cc.should == c}
+    @pool.hold do |cc|
+      cc.should == c
+      Thread.new{@pool.hold{|cc2| cc2.should == c2}}
+    end
+  end
+
+  specify "should store connections in a queue if :connection_handling=>:queue" do
+    @pool = Sequel::ConnectionPool.get_pool(@cp_opts.merge(:connection_handling=>:queue)){@invoked_count += 1}
+    c2 = nil
+    c = @pool.hold{|cc| Thread.new{@pool.hold{|cc2| c2 = cc2}}.join; cc}
+    @pool.size.should == 2
+    @pool.hold{|cc| cc.should == c2}
+    @pool.hold{|cc| cc.should == c}
+    @pool.hold do |cc|
+      cc.should == c2
+      Thread.new{@pool.hold{|cc2| cc2.should == c}}
+    end
+  end
+
+  specify "should not store connections if :connection_handling=>:disconnect" do
+    @pool = Sequel::ConnectionPool.get_pool(@cp_opts.merge(:connection_handling=>:disconnect)){@invoked_count += 1}
+    d = []
+    @pool.disconnection_proc = proc{|c| d << c}
+    c = @pool.hold do |cc|
+      cc.should == 1
+      Thread.new{@pool.hold{|cc2| cc2.should == 2}}.join
+      d.should == [2]
+      @pool.hold{|cc3| cc3.should == 1}
+    end
+    @pool.size.should == 0
+    d.should == [2, 1]
+
+    @pool.hold{|cc| cc.should == 3}
+    @pool.size.should == 0
+    d.should == [2, 1, 3]
+
+    @pool.hold{|cc| cc.should == 4}
+    @pool.size.should == 0
+    d.should == [2, 1, 3, 4]
+  end
 end
 
 describe "Threaded Unsharded Connection Pool" do
@@ -368,6 +454,16 @@ describe "A connection pool with multiple servers" do
   before do
     @invoked_counts = Hash.new(0)
     @pool = Sequel::ConnectionPool.get_pool(CONNECTION_POOL_DEFAULTS.merge(:servers=>{:read_only=>{}})){|server| "#{server}#{@invoked_counts[server] += 1}"}
+  end
+  
+  specify "#all_connections should return connections for all servers" do
+    @pool.hold{}
+    @pool.all_connections{|c1| c1.should == "default1"}
+    a = []
+    @pool.hold(:read_only) do |c|
+      @pool.all_connections{|c1| a << c1}
+    end
+    a.sort_by{|c| c.to_s}.should == ["default1", "read_only1"]
   end
   
   specify "#servers should return symbols for all servers" do
@@ -624,6 +720,16 @@ describe "A single threaded pool with multiple servers" do
     @pool = Sequel::ConnectionPool.get_pool(ST_CONNECTION_POOL_DEFAULTS.merge(:disconnection_proc=>proc{|c| @max_size=3}, :servers=>{:read_only=>{}})){|server| server}
   end
   
+  specify "#all_connections should return connections for all servers" do
+    @pool.hold{}
+    @pool.all_connections{|c1| c1.should == :default}
+    a = []
+    @pool.hold(:read_only) do
+      @pool.all_connections{|c1| a << c1}
+    end
+    a.sort_by{|c| c.to_s}.should == [:default, :read_only]
+  end
+  
   specify "#servers should return symbols for all servers" do
     @pool.servers.sort_by{|s| s.to_s}.should == [:default, :read_only]
   end
@@ -730,6 +836,32 @@ describe "A single threaded pool with multiple servers" do
 end
 
 shared_examples_for "All connection pools classes" do
+  specify "should have all_connections yield current and available connections" do
+    p = @class.new({}){123}
+    p.hold{|c| p.all_connections{|c1| c.should == c1}}
+  end
+
+  specify "should be able to modify after_connect proc after the pool is created" do
+    a = []
+    p = @class.new({}){123}
+    p.after_connect = pr = proc{|c| a << c}
+    p.after_connect.should == pr
+    a.should == []
+    p.hold{}
+    a.should == [123]
+  end
+
+  specify "should be able to modify disconnection_proc after the pool is created" do
+    a = []
+    p = @class.new({}){123}
+    p.disconnection_proc = pr = proc{|c| a << c}
+    p.disconnection_proc.should == pr
+    p.hold{}
+    a.should == []
+    p.disconnect
+    a.should == [123]
+  end
+
   specify "should not raise an error when disconnecting twice" do
     c = @class.new({}){123}
     proc{c.disconnect}.should_not raise_error
@@ -785,6 +917,20 @@ shared_examples_for "All connection pools classes" do
     c.disconnect{|c| y = c}
     x.should == nil
     y.should == 123
+  end
+  
+  specify "should have a reentrent hold method" do
+    o = Object.new
+    c = @class.new({}){o}
+    c.hold do |x|
+      x.should == o
+      c.hold do |x1|
+        x1.should == o
+        c.hold do |x2|
+          x2.should == o
+        end
+      end
+    end
   end
   
   specify "should have a servers method that returns an array of shard/server symbols" do

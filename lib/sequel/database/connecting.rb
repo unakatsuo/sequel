@@ -6,7 +6,7 @@ module Sequel
     # ---------------------
 
     # Array of supported database adapters
-    ADAPTERS = %w'ado amalgalite db2 dbi do firebird ibmdb informix jdbc mock mysql mysql2 odbc openbase oracle postgres sqlite swift tinytds'.collect{|x| x.to_sym}
+    ADAPTERS = %w'ado amalgalite cubrid db2 dbi do firebird ibmdb informix jdbc mock mysql mysql2 odbc openbase oracle postgres sqlite swift tinytds'.collect{|x| x.to_sym}
 
     # Whether to use the single threaded connection pool by default
     @@single_threaded = false
@@ -49,6 +49,7 @@ module Sequel
       when String
         if match = /\A(jdbc|do):/o.match(conn_string)
           c = adapter_class(match[1].to_sym)
+          opts = opts.merge(:orig_opts=>opts.dup)
           opts = {:uri=>conn_string}.merge(opts)
         else
           uri = URI.parse(conn_string)
@@ -58,11 +59,14 @@ module Sequel
           uri_options = c.send(:uri_to_options, uri)
           uri.query.split('&').collect{|s| s.split('=')}.each{|k,v| uri_options[k.to_sym] = v if k && !k.empty?} unless uri.query.to_s.strip.empty?
           uri_options.to_a.each{|k,v| uri_options[k] = URI.unescape(v) if v.is_a?(String)}
+          opts = opts.merge(:orig_opts=>opts.dup)
+          opts[:uri] = conn_string
           opts = uri_options.merge(opts)
           opts[:adapter] = scheme
         end
       when Hash
         opts = conn_string.merge(opts)
+        opts = opts.merge(:orig_opts=>opts.dup)
         c = adapter_class(opts[:adapter_class] || opts[:adapter] || opts['adapter'])
       else
         raise Error, "Sequel::Database.connect takes either a Hash or a String, given: #{conn_string.inspect}"
@@ -80,7 +84,7 @@ module Sequel
       ensure
         if block_given?
           db.disconnect if db
-          ::Sequel::DATABASES.delete(db)
+          Sequel.synchronize{::Sequel::DATABASES.delete(db)}
         end
       end
       block_given? ? result : db
@@ -140,8 +144,10 @@ module Sequel
     #
     #   DB.add_servers(:f=>{:host=>"hash_host_f"})
     def add_servers(servers)
-      @opts[:servers] = @opts[:servers] ? @opts[:servers].merge(servers) : servers
-      @pool.add_servers(servers.keys)
+      if h = @opts[:servers]
+        Sequel.synchronize{h.merge!(servers)}
+        @pool.add_servers(servers.keys)
+      end
     end
     
     # Connects to the database. This method should be overridden by descendants.
@@ -196,11 +202,8 @@ module Sequel
     #
     #   DB.remove_servers(:f1, :f2)
     def remove_servers(*servers)
-      if @opts[:servers] && !@opts[:servers].empty?
-        servs = @opts[:servers].dup
-        servers.flatten!
-        servers.each{|s| servs.delete(s)}
-        @opts[:servers] = servs
+      if h = @opts[:servers]
+        servers.flatten.each{|s| Sequel.synchronize{h.delete(s)}}
         @pool.remove_servers(servers)
       end
     end
@@ -218,20 +221,26 @@ module Sequel
       @single_threaded
     end
     
-    # Acquires a database connection, yielding it to the passed block. This is
-    # useful if you want to make sure the same connection is used for all
-    # database queries in the block.  It is also useful if you want to gain
-    # direct access to the underlying connection object if you need to do
-    # something Sequel does not natively support.
-    #
-    # If a server option is given, acquires a connection for that specific
-    # server, instead of the :default server.
-    #
-    #   DB.synchronize do |conn|
-    #     ...
-    #   end
-    def synchronize(server=nil, &block)
-      @pool.hold(server || :default, &block)
+    if !defined?(RUBY_ENGINE) || RUBY_ENGINE == 'ruby'
+      # Acquires a database connection, yielding it to the passed block. This is
+      # useful if you want to make sure the same connection is used for all
+      # database queries in the block.  It is also useful if you want to gain
+      # direct access to the underlying connection object if you need to do
+      # something Sequel does not natively support.
+      #
+      # If a server option is given, acquires a connection for that specific
+      # server, instead of the :default server.
+      #
+      #   DB.synchronize do |conn|
+      #     ...
+      #   end
+      def synchronize(server=nil)
+        @pool.hold(server || :default){|conn| yield conn}
+      end
+    else
+      def synchronize(server=nil, &block)
+        @pool.hold(server || :default, &block)
+      end
     end
     
     # Attempts to acquire a database connection.  Returns true if successful.
@@ -263,6 +272,8 @@ module Sequel
         else
           raise Error, 'Server opts should be a hash or proc'
         end
+      elsif server.is_a?(Hash)
+        @opts.merge(server)
       else
         @opts.dup
       end

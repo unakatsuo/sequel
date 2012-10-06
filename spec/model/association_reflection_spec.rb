@@ -134,7 +134,7 @@ describe Sequel::Model::Associations::AssociationReflection, "#select" do
   it "should be the associated_table.* if :select is not present for a many_to_many associaiton" do
     @c.many_to_many :cs, :class=>'ParParent'
     @c.association_reflection(:cs).keys.should_not include(:select)
-    @c.association_reflection(:cs).select.should == :par_parents.*
+    @c.association_reflection(:cs).select.should == Sequel::SQL::ColumnAll.new(:par_parents)
   end
   it "should be if :select is not present for a many_to_one and one_to_many associaiton" do
     @c.one_to_many :cs, :class=>'ParParent'
@@ -184,6 +184,38 @@ describe Sequel::Model::Associations::AssociationReflection, "#associated_object
     @c.association_reflection(:cs).associated_object_keys.should == [:d_id]
     @c.many_to_many :cs, :class=>ParParent, :right_key=>[:c_id1, :c_id2], :right_primary_key=>[:id1, :id2]
     @c.association_reflection(:cs).associated_object_keys.should == [:id1, :id2]
+  end
+end
+
+describe Sequel::Model::Associations::AssociationReflection do
+  before do
+    @c = Class.new(Sequel::Model(:foo))
+    @c.meta_def(:name){"C"}
+  end
+
+  it "#eager_loading_predicate_key should be an alias of predicate_key for backwards compatibility" do
+    @c.one_to_many :cs, :class=>@c
+    @c.dataset.literal(@c.association_reflection(:cs).eager_loading_predicate_key).should == 'foo.c_id'
+  end
+
+  it "one_to_many #qualified_primary_key should be a qualified version of the primary key" do
+    @c.one_to_many :cs, :class=>@c
+    @c.dataset.literal(@c.association_reflection(:cs).qualified_primary_key).should == 'foo.id'
+  end
+
+  it "many_to_many #associated_key_column should be the left key" do
+    @c.many_to_many :cs, :class=>@c
+    @c.association_reflection(:cs).associated_key_column.should == :c_id
+  end
+
+  it "many_to_many #qualified_right_key should be a qualified version of the primary key" do
+    @c.many_to_many :cs, :class=>@c, :right_key=>:c2_id
+    @c.dataset.literal(@c.association_reflection(:cs).qualified_right_key).should == 'cs_cs.c2_id'
+  end
+
+  it "many_to_many #qualified_right_primary_key should be a qualified version of the primary key" do
+    @c.many_to_many :cs, :class=>@c
+    @c.dataset.literal(@c.association_reflection(:cs).qualified_right_primary_key).should == 'foo.id'
   end
 end
 

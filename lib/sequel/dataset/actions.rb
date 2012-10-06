@@ -11,8 +11,8 @@ module Sequel
     ACTION_METHODS = (<<-METHS).split.map{|x| x.to_sym}
       << [] []= all avg count columns columns! delete each
       empty? fetch_rows first get import insert insert_multiple interval last
-      map max min multi_insert range select_hash select_map select_order_map
-      set single_record single_value sum to_csv to_hash truncate update
+      map max min multi_insert range select_hash select_hash_groups select_map select_order_map
+      set single_record single_value sum to_csv to_hash to_hash_groups truncate update
     METHS
 
     # Inserts the given argument into the database.  Returns self so it
@@ -93,12 +93,30 @@ module Sequel
       columns
     end
     
-    # Returns the number of records in the dataset.
+    # Returns the number of records in the dataset. If an argument is provided,
+    # it is used as the argument to count.  If a block is provided, it is
+    # treated as a virtual row, and the result is used as the argument to
+    # count.
     #
     #   DB[:table].count # SELECT COUNT(*) AS count FROM table LIMIT 1
     #   # => 3
-    def count
-      aggregate_dataset.get{COUNT(:*){}.as(count)}.to_i
+    #   DB[:table].count(:column) # SELECT COUNT(column) AS count FROM table LIMIT 1
+    #   # => 2
+    #   DB[:table].count{foo(column)} # SELECT COUNT(foo(column)) AS count FROM table LIMIT 1
+    #   # => 1
+    def count(arg=(no_arg=true), &block)
+      if no_arg
+        if block
+          arg = Sequel.virtual_row(&block)
+          aggregate_dataset.get{COUNT(arg).as(count)}
+        else
+          aggregate_dataset.get{COUNT(:*){}.as(count)}.to_i
+        end
+      elsif block
+        raise Error, 'cannot provide both argument and block to Dataset#count'
+      else
+        aggregate_dataset.get{COUNT(arg).as(count)}
+      end
     end
     
     # Deletes the records in the dataset.  The returned value should be 
@@ -124,23 +142,23 @@ module Sequel
     # running additional queries inside the provided block.  If you are
     # running queries inside the block, you should use +all+ instead of +each+
     # for the outer queries, or use a separate thread or shard inside +each+:
-    def each(&block)
+    def each
       if @opts[:graph]
-        graph_each(&block)
+        graph_each{|r| yield r}
       elsif row_proc = @row_proc
         fetch_rows(select_sql){|r| yield row_proc.call(r)}
       else
-        fetch_rows(select_sql, &block)
+        fetch_rows(select_sql){|r| yield r}
       end
       self
     end
     
     # Returns true if no records exist in the dataset, false otherwise
     #
-    #   DB[:table].empty? # SELECT 1 FROM table LIMIT 1
+    #   DB[:table].empty? # SELECT 1 AS one FROM table LIMIT 1
     #   # => false
     def empty?
-      get(1).nil?
+      get(Sequel::SQL::AliasedExpression.new(1, :one)).nil?
     end
 
     # Executes a select query and fetches records, yielding each record to the
@@ -204,12 +222,12 @@ module Sequel
     #
     #   ds.get{sum(id)} # SELECT sum(id) FROM table LIMIT 1
     #   # => 6
-    def get(column=nil, &block)
-      if column
-        raise(Error, ARG_BLOCK_ERROR_MSG) if block
-        select(column).single_value
-      else
+    def get(column=(no_arg=true; nil), &block)
+      if block
+        raise(Error, ARG_BLOCK_ERROR_MSG) unless no_arg
         select(&block).single_value
+      else
+        select(column).single_value
       end
     end
     
@@ -229,31 +247,33 @@ module Sequel
     #   DB[:table].import([:x, :y], DB[:table2].select(:a, :b))
     #   # INSERT INTO table (x, y) SELECT a, b FROM table2 
     #
-    # The method also accepts a :slice or :commit_every option that specifies
-    # the number of records to insert per transaction. This is useful especially
-    # when inserting a large number of records, e.g.:
-    #
-    #   # this will commit every 50 records
-    #   dataset.import([:x, :y], [[1, 2], [3, 4], ...], :slice => 50)
+    # Options:
+    # :commit_every :: Open a new transaction for every given number of records.
+    #                  For example, if you provide a value of 50, will commit
+    #                  after every 50 records.
+    # :server :: Set the server/shard to use for the transaction and insert
+    #            queries.
+    # :slice :: Same as :commit_every, :commit_every takes precedence.
     def import(columns, values, opts={})
       return @db.transaction{insert(columns, values)} if values.is_a?(Dataset)
 
       return if values.empty?
       raise(Error, IMPORT_ERROR_MSG) if columns.empty?
+      ds = opts[:server] ? server(opts[:server]) : self
       
       if slice_size = opts[:commit_every] || opts[:slice]
         offset = 0
-        loop do
-          @db.transaction(opts){multi_insert_sql(columns, values[offset, slice_size]).each{|st| execute_dui(st)}}
+        rows = []
+        while offset < values.length
+          rows << ds._import(columns, values[offset, slice_size], opts)
           offset += slice_size
-          break if offset >= values.length
         end
+        rows.flatten
       else
-        statements = multi_insert_sql(columns, values)
-        @db.transaction{statements.each{|st| execute_dui(st)}}
+        ds._import(columns, values, opts)
       end
     end
-  
+
     # Inserts values into the associated table.  The returned value is generally
     # the value of the primary key for the inserted row, but that is adapter dependent.
     #
@@ -300,21 +320,24 @@ module Sequel
     
     # Inserts multiple values. If a block is given it is invoked for each
     # item in the given array before inserting it.  See +multi_insert+ as
-    # a possible faster version that inserts multiple records in one
-    # SQL statement.
+    # a possibly faster version that may be able to insert multiple
+    # records in one SQL statement (if supported by the database).
+    # Returns an array of primary keys of inserted rows.
     #
     #   DB[:table].insert_multiple([{:x=>1}, {:x=>2}])
+    #   # => [4, 5]
     #   # INSERT INTO table (x) VALUES (1)
     #   # INSERT INTO table (x) VALUES (2)
     #
-    #   DB[:table].insert_multiple([{:x=>1}, {:x=>2}]){|row| row[:y] = row[:x] * 2}
+    #   DB[:table].insert_multiple([{:x=>1}, {:x=>2}]){|row| row[:y] = row[:x] * 2; row }
+    #   # => [6, 7]
     #   # INSERT INTO table (x, y) VALUES (1, 2)
     #   # INSERT INTO table (x, y) VALUES (2, 4)
     def insert_multiple(array, &block)
       if block
-        array.each {|i| insert(block[i])}
+        array.map{|i| insert(block.call(i))}
       else
-        array.each {|i| insert(i)}
+        array.map{|i| insert(i)}
       end
     end
     
@@ -335,7 +358,7 @@ module Sequel
     #   DB[:table].order(:id).last # SELECT * FROM table ORDER BY id DESC LIMIT 1
     #   # => {:id=>10}
     #
-    #   DB[:table].order(:id.desc).last(2) # SELECT * FROM table ORDER BY id ASC LIMIT 2
+    #   DB[:table].order(Sequel.desc(:id)).last(2) # SELECT * FROM table ORDER BY id ASC LIMIT 2
     #   # => [{:id=>1}, {:id=>2}]
     def last(*args, &block)
       raise(Error, 'No order specified') unless @opts[:order]
@@ -397,7 +420,7 @@ module Sequel
     # otherwise some columns could be missed or set to null instead of to default
     # values.
     #
-    # You can also use the :slice or :commit_every option that import accepts.
+    # This respects the same options as #import.
     def multi_insert(hashes, opts={})
       return if hashes.empty?
       columns = hashes.first.keys
@@ -416,7 +439,7 @@ module Sequel
     end
     
     # Returns a hash with key_column values as keys and value_column values as
-    # values.  Similar to to_hash, but only selects the two columns.
+    # values.  Similar to to_hash, but only selects the columns given.
     #
     #   DB[:table].select_hash(:id, :name) # SELECT id, name FROM table
     #   # => {1=>'a', 2=>'b', ...}
@@ -426,20 +449,33 @@ module Sequel
     #
     #   DB[:table].select_hash([:id, :foo], [:name, :bar]) # SELECT * FROM table
     #   # {[1, 3]=>['a', 'c'], [2, 4]=>['b', 'd'], ...}
+    #
+    # When using this method, you must be sure that each expression has an alias
+    # that Sequel can determine.  Usually you can do this by calling the #as method
+    # on the expression and providing an alias.
     def select_hash(key_column, value_column)
-      if key_column.is_a?(Array)
-        if value_column.is_a?(Array)
-          select(*(key_column + value_column)).to_hash(key_column.map{|c| hash_key_symbol(c)}, value_column.map{|c| hash_key_symbol(c)})
-        else
-          select(*(key_column + [value_column])).to_hash(key_column.map{|c| hash_key_symbol(c)}, hash_key_symbol(value_column))
-        end
-      elsif value_column.is_a?(Array)
-        select(key_column, *value_column).to_hash(hash_key_symbol(key_column), value_column.map{|c| hash_key_symbol(c)})
-      else
-        select(key_column, value_column).to_hash(hash_key_symbol(key_column), hash_key_symbol(value_column))
-      end
+      _select_hash(:to_hash, key_column, value_column)
     end
     
+    # Returns a hash with key_column values as keys and an array of value_column values.
+    # Similar to to_hash_groups, but only selects the columns given.
+    #
+    #   DB[:table].select_hash(:name, :id) # SELECT id, name FROM table
+    #   # => {'a'=>[1, 4, ...], 'b'=>[2, ...], ...}
+    #
+    # You can also provide an array of column names for either the key_column,
+    # the value column, or both:
+    #
+    #   DB[:table].select_hash([:first, :middle], [:last, :id]) # SELECT * FROM table
+    #   # {['a', 'b']=>[['c', 1], ['d', 2], ...], ...}
+    #
+    # When using this method, you must be sure that each expression has an alias
+    # that Sequel can determine.  Usually you can do this by calling the #as method
+    # on the expression and providing an alias.
+    def select_hash_groups(key_column, value_column)
+      _select_hash(:to_hash_groups, key_column, value_column)
+    end
+
     # Selects the column given (either as an argument or as a block), and
     # returns an array of all values of that column in the dataset.  If you
     # give a block argument that returns an array with multiple entries,
@@ -456,10 +492,13 @@ module Sequel
     #
     #   DB[:table].select_map([:id, :name]) # SELECT id, name FROM table
     #   # => [[1, 'A'], [2, 'B'], [3, 'C'], ...]
+    #
+    # If you provide an array of expressions, you must be sure that each entry
+    # in the array has an alias that Sequel can determine.  Usually you can do this
+    # by calling the #as method on the expression and providing an alias.
     def select_map(column=nil, &block)
       _select_map(column, false, &block)
     end
-
     
     # The same as select_map, but in addition orders the array by the column.
     #
@@ -473,6 +512,10 @@ module Sequel
     #
     #   DB[:table].select_order_map([:id, :name]) # SELECT id, name FROM table ORDER BY id, name
     #   # => [[1, 'A'], [2, 'B'], [3, 'C'], ...]
+    #
+    # If you provide an array of expressions, you must be sure that each entry
+    # in the array has an alias that Sequel can determine.  Usually you can do this
+    # by calling the #as method on the expression and providing an alias.
     def select_order_map(column=nil, &block)
       _select_map(column, true, &block)
     end
@@ -574,6 +617,49 @@ module Sequel
       h
     end
 
+    # Returns a hash with one column used as key and the values being an
+    # array of column values. If the value_column is not given or nil, uses
+    # the entire hash as the value.
+    #
+    #   DB[:table].to_hash(:name, :id) # SELECT * FROM table
+    #   # {'Jim'=>[1, 4, 16, ...], 'Bob'=>[2], ...}
+    #
+    #   DB[:table].to_hash(:name) # SELECT * FROM table
+    #   # {'Jim'=>[{:id=>1, :name=>'Jim'}, {:id=>4, :name=>'Jim'}, ...], 'Bob'=>[{:id=>2, :name=>'Bob'}], ...}
+    #
+    # You can also provide an array of column names for either the key_column,
+    # the value column, or both:
+    #
+    #   DB[:table].to_hash([:first, :middle], [:last, :id]) # SELECT * FROM table
+    #   # {['Jim', 'Bob']=>[['Smith', 1], ['Jackson', 4], ...], ...}
+    #
+    #   DB[:table].to_hash([:first, :middle]) # SELECT * FROM table
+    #   # {['Jim', 'Bob']=>[{:id=>1, :first=>'Jim', :middle=>'Bob', :last=>'Smith'}, ...], ...}
+    def to_hash_groups(key_column, value_column = nil)
+      h = {}
+      if value_column
+        return naked.to_hash_groups(key_column, value_column) if row_proc
+        if value_column.is_a?(Array)
+          if key_column.is_a?(Array)
+            each{|r| (h[r.values_at(*key_column)] ||= []) << r.values_at(*value_column)}
+          else
+            each{|r| (h[r[key_column]] ||= []) << r.values_at(*value_column)}
+          end
+        else
+          if key_column.is_a?(Array)
+            each{|r| (h[r.values_at(*key_column)] ||= []) << r[value_column]}
+          else
+            each{|r| (h[r[key_column]] ||= []) << r[value_column]}
+          end
+        end
+      elsif key_column.is_a?(Array)
+        each{|r| (h[r.values_at(*key_column)] ||= []) << r}
+      else
+        each{|r| (h[r[key_column]] ||= []) << r}
+      end
+      h
+    end
+
     # Truncates the dataset.  Returns nil.
     #
     #   DB[:table].truncate # TRUNCATE table
@@ -601,8 +687,28 @@ module Sequel
       end
     end
 
+    # Execute the given SQL and return the number of rows deleted.  This exists
+    # solely as an optimization, replacing with_sql(sql).delete.  It's significantly
+    # faster as it does not require cloning the current dataset.
+    def with_sql_delete(sql)
+      execute_dui(sql)
+    end
+
     protected
 
+    # Internals of #import.  If primary key values are requested, use
+    # separate insert commands for each row.  Otherwise, call #multi_insert_sql
+    # and execute each statement it gives separately.
+    def _import(columns, values, opts)
+      trans_opts = opts.merge(:server=>@opts[:server])
+      if opts[:return] == :primary_key
+        @db.transaction(trans_opts){values.map{|v| insert(columns, v)}}
+      else
+        stmts = multi_insert_sql(columns, values)
+        @db.transaction(trans_opts){stmts.each{|st| execute_dui(st)}}
+      end
+    end
+  
     # Return an array of arrays of values given by the symbols in ret_cols.
     def _select_map_multiple(ret_cols)
       map{|r| r.values_at(*ret_cols)}
@@ -615,20 +721,30 @@ module Sequel
   
     private
     
+    # Internals of +select_hash+ and +select_hash_groups+
+    def _select_hash(meth, key_column, value_column)
+      if key_column.is_a?(Array)
+        if value_column.is_a?(Array)
+          select(*(key_column + value_column)).send(meth, key_column.map{|c| hash_key_symbol(c)}, value_column.map{|c| hash_key_symbol(c)})
+        else
+          select(*(key_column + [value_column])).send(meth, key_column.map{|c| hash_key_symbol(c)}, hash_key_symbol(value_column))
+        end
+      elsif value_column.is_a?(Array)
+        select(key_column, *value_column).send(meth, hash_key_symbol(key_column), value_column.map{|c| hash_key_symbol(c)})
+      else
+        select(key_column, value_column).send(meth, hash_key_symbol(key_column), hash_key_symbol(value_column))
+      end
+    end
+    
     # Internals of +select_map+ and +select_order_map+
     def _select_map(column, order, &block)
       ds = naked.ungraphed
-      if column
-        raise(Error, ARG_BLOCK_ERROR_MSG) if block
-        columns = Array(column)
-        select_cols = order ? columns.map{|c| c.is_a?(SQL::OrderedExpression) ? c.expression : c} : columns
-        ds = ds.select(*select_cols)
-        ds = ds.order(*columns.map{|c| unaliased_identifier(c)}) if order
-      else
-        ds = ds.select(&block)
-        ds = ds.order(&block) if order
-      end
-      if column.is_a?(Array)
+      columns = Array(column)
+      virtual_row_columns(columns, block)
+      select_cols = order ? columns.map{|c| c.is_a?(SQL::OrderedExpression) ? c.expression : c} : columns
+      ds = ds.select(*select_cols)
+      ds = ds.order(*columns.map{|c| unaliased_identifier(c)}) if order
+      if column.is_a?(Array) || (columns.length > 1)
         ds._select_map_multiple(select_cols.map{|c| hash_key_symbol(c)})
       else
         ds._select_map_single
@@ -670,12 +786,14 @@ module Sequel
       when Symbol
         _, c, a = split_symbol(s)
         (a || c).to_sym
-      when SQL::Identifier
+      when SQL::Identifier, SQL::Wrapper
         hash_key_symbol(s.value)
       when SQL::QualifiedIdentifier
         hash_key_symbol(s.column)
       when SQL::AliasedExpression
         hash_key_symbol(s.aliaz)
+      when String
+        s.to_sym
       else
         raise(Error, "#{s.inspect} is not supported, should be a Symbol, String, SQL::Identifier, SQL::QualifiedIdentifier, or SQL::AliasedExpression") 
       end
@@ -720,10 +838,9 @@ module Sequel
       when SQL::AliasedExpression
         c.expression
       when SQL::OrderedExpression
-        expr = c.expression
-        if expr.is_a?(Symbol)
-          expr = unaliased_identifier(expr)
-          SQL::OrderedExpression.new(unaliased_identifier(c.expression), c.descending, :nulls=>c.nulls)
+        case expr = c.expression
+        when Symbol, SQL::AliasedExpression
+          SQL::OrderedExpression.new(unaliased_identifier(expr), c.descending, :nulls=>c.nulls)
         else
           c
         end

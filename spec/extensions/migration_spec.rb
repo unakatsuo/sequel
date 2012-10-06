@@ -129,6 +129,7 @@ describe "Reversible Migrations with Sequel.migration{change{}}" do
         rename_column :e, :g
       end
       create_view(:c, 'SELECT * FROM b')
+      create_join_table(:cat_id=>:cats, :dog_id=>:dogs)
     end
   end
   
@@ -150,13 +151,16 @@ describe "Reversible Migrations with Sequel.migration{change{}}" do
         [:add_spatial_index, :e, {:name=>"e_s"}],
         [:rename_column, :e, :g]]
       ],
-      [:create_view, :c, "SELECT * FROM b"]]
+      [:create_view, :c, "SELECT * FROM b"],
+      [:create_join_table, {:cat_id=>:cats, :dog_id=>:dogs}]]
   end
 
   specify "should execute down with reversing actions in reverse order" do
     p = @p
     Sequel.migration{change(&p)}.apply(@db, :down)
-    @db.actions.should == [[:drop_view, :c],
+    @db.actions.should == [
+      [:drop_join_table, {:cat_id=>:cats, :dog_id=>:dogs}],
+      [:drop_view, :c],
       [:alter_table, [
         [:rename_column, :g, :e],
         [:drop_index, :e, {:name=>"e_s"}],
@@ -273,7 +277,19 @@ describe "Sequel::IntegerMigrator" do
     @db.creates.should == [1111, 2222, 3333]
     @db.version.should == 3
     @db.sqls.map{|x| x =~ /\AUPDATE.*(\d+)/ ? $1.to_i : nil}.compact.should == [1, 2, 3]
+  end
+  
+  specify "should be able to tell whether there are outstanding migrations" do
+    Sequel::Migrator.is_current?(@db, @dirname).should be_false
+    Sequel::Migrator.apply(@db, @dirname)
+    Sequel::Migrator.is_current?(@db, @dirname).should be_true
   end 
+
+  specify "should have #check_current raise an exception if the migrator is not current" do
+    proc{Sequel::Migrator.check_current(@db, @dirname)}.should raise_error(Sequel::Migrator::NotCurrentError)
+    Sequel::Migrator.apply(@db, @dirname)
+    proc{Sequel::Migrator.check_current(@db, @dirname)}.should_not raise_error
+  end
 
   specify "should apply migrations correctly in the up direction with target" do
     Sequel::Migrator.apply(@db, @dirname, 2)
@@ -311,6 +327,37 @@ describe "Sequel::IntegerMigrator" do
     Sequel::Migrator.apply(@db, @dirname, 0).should == 0
     Sequel::Migrator.apply(@db, @dirname).should == 3
   end
+
+  specify "should use IntegerMigrator if IntegerMigrator.apply called, even for timestamped migration directory" do
+    proc{Sequel::IntegerMigrator.apply(@db, "spec/files/timestamped_migrations")}.should raise_error(Sequel::Migrator::Error)
+  end
+
+  specify "should not use transactions by default" do
+    Sequel::Migrator.apply(@db, "spec/files/transaction_unspecified_migrations")
+    @db.sqls.should == ["CREATE TABLE schema_info (version integer DEFAULT 0 NOT NULL)", "SELECT 1 AS one FROM schema_info LIMIT 1", "INSERT INTO schema_info (version) VALUES (0)", "SELECT version FROM schema_info LIMIT 1", "CREATE TABLE sm11111 (smc1 integer)", "UPDATE schema_info SET version = 1", "CREATE TABLE sm (smc1 integer)", "UPDATE schema_info SET version = 2"]
+  end
+
+  specify "should use transactions by default if the database supports transactional ddl" do
+    @db.meta_def(:supports_transactional_ddl?){true}
+    Sequel::Migrator.apply(@db, "spec/files/transaction_unspecified_migrations")
+    @db.sqls.should == ["CREATE TABLE schema_info (version integer DEFAULT 0 NOT NULL)", "SELECT 1 AS one FROM schema_info LIMIT 1", "INSERT INTO schema_info (version) VALUES (0)", "SELECT version FROM schema_info LIMIT 1", "BEGIN", "CREATE TABLE sm11111 (smc1 integer)", "UPDATE schema_info SET version = 1", "COMMIT", "BEGIN", "CREATE TABLE sm (smc1 integer)", "UPDATE schema_info SET version = 2", "COMMIT"]
+  end
+
+  specify "should respect transaction use on a per migration basis" do
+    @db.meta_def(:supports_transactional_ddl?){true}
+    Sequel::Migrator.apply(@db, "spec/files/transaction_specified_migrations")
+    @db.sqls.should == ["CREATE TABLE schema_info (version integer DEFAULT 0 NOT NULL)", "SELECT 1 AS one FROM schema_info LIMIT 1", "INSERT INTO schema_info (version) VALUES (0)", "SELECT version FROM schema_info LIMIT 1", "BEGIN", "CREATE TABLE sm11111 (smc1 integer)", "UPDATE schema_info SET version = 1", "COMMIT", "CREATE TABLE sm (smc1 integer)", "UPDATE schema_info SET version = 2"]
+  end
+
+  specify "should force transactions if enabled in the migrator" do
+    Sequel::Migrator.run(@db, "spec/files/transaction_specified_migrations", :use_transactions=>true)
+    @db.sqls.should == ["CREATE TABLE schema_info (version integer DEFAULT 0 NOT NULL)", "SELECT 1 AS one FROM schema_info LIMIT 1", "INSERT INTO schema_info (version) VALUES (0)", "SELECT version FROM schema_info LIMIT 1", "BEGIN", "CREATE TABLE sm11111 (smc1 integer)", "UPDATE schema_info SET version = 1", "COMMIT", "BEGIN", "CREATE TABLE sm (smc1 integer)", "UPDATE schema_info SET version = 2", "COMMIT"]
+  end
+
+  specify "should not use transactions if disabled in the migrator" do
+    Sequel::Migrator.run(@db, "spec/files/transaction_unspecified_migrations", :use_transactions=>false)
+    @db.sqls.should == ["CREATE TABLE schema_info (version integer DEFAULT 0 NOT NULL)", "SELECT 1 AS one FROM schema_info LIMIT 1", "INSERT INTO schema_info (version) VALUES (0)", "SELECT version FROM schema_info LIMIT 1", "CREATE TABLE sm11111 (smc1 integer)", "UPDATE schema_info SET version = 1", "CREATE TABLE sm (smc1 integer)", "UPDATE schema_info SET version = 2"]
+  end
 end
 
 describe "Sequel::TimestampMigrator" do
@@ -322,6 +369,7 @@ describe "Sequel::TimestampMigrator" do
       define_method(:sequel_migration_version=){|v| sequel_migration_version = v}
 
       def columns
+        super
         case opts[:from].first
         when :schema_info, 'schema_info'
           [:version]
@@ -333,6 +381,7 @@ describe "Sequel::TimestampMigrator" do
       end
 
       def fetch_rows(sql)
+        super
         case opts[:from].first
         when :schema_info, 'schema_info'
           yield({:version=>sequel_migration_version})
@@ -344,6 +393,7 @@ describe "Sequel::TimestampMigrator" do
       end
 
       def insert(h={})
+        super
         case opts[:from].first
         when :schema_info, 'schema_info'
           self.sequel_migration_version = h.values.first
@@ -353,6 +403,7 @@ describe "Sequel::TimestampMigrator" do
       end
 
       def update(h={})
+        super
         case opts[:from].first
         when :schema_info, 'schema_info'
           self.sequel_migration_version = h.values.first
@@ -360,6 +411,7 @@ describe "Sequel::TimestampMigrator" do
       end
 
       def delete
+        super
         case opts[:from].first
         when :schema_migrations, :sm, 'schema_migrations', 'sm'
           self.class::FILES.delete(opts[:where].args.last)
@@ -367,11 +419,14 @@ describe "Sequel::TimestampMigrator" do
       end
     end
     dbc = Class.new(Sequel::Mock::Database) do
-      tables = {}
+      self::Tables = tables= {}
       define_method(:dataset){|*a| dsc.new(self, *a)}
-      define_method(:create_table){|name, *args| tables[name.to_sym] = true}
-      define_method(:drop_table){|*names| names.each{|n| tables.delete(n.to_sym)}}
-      define_method(:table_exists?){|name| tables.has_key?(name.to_sym)}
+      def create_table(name, *args, &block)
+        super
+        self.class::Tables[name.to_sym] = true
+      end
+      define_method(:drop_table){|*names| super(*names); names.each{|n| tables.delete(n.to_sym)}}
+      define_method(:table_exists?){|name| super(name); tables.has_key?(name.to_sym)}
     end
     @db = dbc.new
     @m = Sequel::Migrator
@@ -403,6 +458,22 @@ describe "Sequel::TimestampMigrator" do
     [:sm2222, :sm3333].each{|n| @db.table_exists?(n).should be_false}
     @db.table_exists?(:sm1111).should be_true
     @db[:schema_migrations].select_order_map(:filename).should == %w'1273253849_create_sessions.rb'
+  end
+
+  specify "should not be current when there are migrations to apply" do
+    @dir = 'spec/files/timestamped_migrations'
+    @m.apply(@db, @dir)
+    @m.is_current?(@db, @dir).should be_true
+    @dir = 'spec/files/interleaved_timestamped_migrations'
+    @m.is_current?(@db, @dir).should be_false
+  end
+
+  specify "should raise an exception if the migrator is not current" do
+    @dir = 'spec/files/timestamped_migrations'
+    @m.apply(@db, @dir)
+    proc{@m.check_current(@db, @dir)}.should_not raise_error
+    @dir = 'spec/files/interleaved_timestamped_migrations'
+    proc{@m.check_current(@db, @dir)}.should raise_error(Sequel::Migrator::NotCurrentError)
   end
 
   specify "should apply all missing files when migrating up" do
@@ -558,5 +629,36 @@ describe "Sequel::TimestampMigrator" do
     @m.apply(@db, @dir, 1273253850).should == nil
     @m.apply(@db, @dir, 0).should == nil
     @m.apply(@db, @dir).should == nil
+  end
+
+  specify "should use TimestampMigrator if TimestampMigrator.apply is called even for integer migrations directory" do
+    Sequel::TimestampMigrator.apply(@db, "spec/files/integer_migrations")
+    @db.sqls.should == ["SELECT NULL FROM schema_migrations LIMIT 1", "CREATE TABLE schema_migrations (filename varchar(255) PRIMARY KEY)", "SELECT NULL FROM schema_info LIMIT 1", "SELECT filename FROM schema_migrations ORDER BY filename", "CREATE TABLE sm1111 (smc1 integer)", "INSERT INTO schema_migrations (filename) VALUES ('001_create_sessions.rb')", "CREATE TABLE sm2222 (smc2 integer)", "INSERT INTO schema_migrations (filename) VALUES ('002_create_nodes.rb')", "CREATE TABLE sm3333 (smc3 integer)", "INSERT INTO schema_migrations (filename) VALUES ('003_3_create_users.rb')"]
+  end
+
+  specify "should not use transactions by default" do
+    Sequel::TimestampMigrator.apply(@db, "spec/files/transaction_unspecified_migrations")
+    @db.sqls.should == ["SELECT NULL FROM schema_migrations LIMIT 1", "CREATE TABLE schema_migrations (filename varchar(255) PRIMARY KEY)", "SELECT NULL FROM schema_info LIMIT 1", "SELECT filename FROM schema_migrations ORDER BY filename", "CREATE TABLE sm11111 (smc1 integer)", "INSERT INTO schema_migrations (filename) VALUES ('001_create_alt_basic.rb')", "CREATE TABLE sm (smc1 integer)", "INSERT INTO schema_migrations (filename) VALUES ('002_create_basic.rb')"]
+  end
+
+  specify "should use transactions by default if database supports transactional ddl" do
+    @db.meta_def(:supports_transactional_ddl?){true}
+    Sequel::TimestampMigrator.apply(@db, "spec/files/transaction_unspecified_migrations")
+    @db.sqls.should == ["SELECT NULL FROM schema_migrations LIMIT 1", "CREATE TABLE schema_migrations (filename varchar(255) PRIMARY KEY)", "SELECT NULL FROM schema_info LIMIT 1", "SELECT filename FROM schema_migrations ORDER BY filename", "BEGIN", "CREATE TABLE sm11111 (smc1 integer)", "INSERT INTO schema_migrations (filename) VALUES ('001_create_alt_basic.rb')", "COMMIT", "BEGIN", "CREATE TABLE sm (smc1 integer)", "INSERT INTO schema_migrations (filename) VALUES ('002_create_basic.rb')", "COMMIT"]
+  end
+
+  specify "should support transaction use on a per migration basis" do
+    Sequel::TimestampMigrator.apply(@db, "spec/files/transaction_specified_migrations")
+    @db.sqls.should == ["SELECT NULL FROM schema_migrations LIMIT 1", "CREATE TABLE schema_migrations (filename varchar(255) PRIMARY KEY)", "SELECT NULL FROM schema_info LIMIT 1", "SELECT filename FROM schema_migrations ORDER BY filename", "BEGIN", "CREATE TABLE sm11111 (smc1 integer)", "INSERT INTO schema_migrations (filename) VALUES ('001_create_alt_basic.rb')", "COMMIT", "CREATE TABLE sm (smc1 integer)", "INSERT INTO schema_migrations (filename) VALUES ('002_create_basic.rb')"]
+  end
+
+  specify "should force transactions if enabled by the migrator" do
+    Sequel::TimestampMigrator.run(@db, "spec/files/transaction_specified_migrations", :use_transactions=>true)
+    @db.sqls.should == ["SELECT NULL FROM schema_migrations LIMIT 1", "CREATE TABLE schema_migrations (filename varchar(255) PRIMARY KEY)", "SELECT NULL FROM schema_info LIMIT 1", "SELECT filename FROM schema_migrations ORDER BY filename", "BEGIN", "CREATE TABLE sm11111 (smc1 integer)", "INSERT INTO schema_migrations (filename) VALUES ('001_create_alt_basic.rb')", "COMMIT", "BEGIN", "CREATE TABLE sm (smc1 integer)", "INSERT INTO schema_migrations (filename) VALUES ('002_create_basic.rb')", "COMMIT"]
+  end
+
+  specify "should not use transactions if disabled in the migrator" do
+    Sequel::TimestampMigrator.run(@db, "spec/files/transaction_unspecified_migrations", :use_transactions=>false)
+    @db.sqls.should == ["SELECT NULL FROM schema_migrations LIMIT 1", "CREATE TABLE schema_migrations (filename varchar(255) PRIMARY KEY)", "SELECT NULL FROM schema_info LIMIT 1", "SELECT filename FROM schema_migrations ORDER BY filename", "CREATE TABLE sm11111 (smc1 integer)", "INSERT INTO schema_migrations (filename) VALUES ('001_create_alt_basic.rb')", "CREATE TABLE sm (smc1 integer)", "INSERT INTO schema_migrations (filename) VALUES ('002_create_basic.rb')"]
   end
 end

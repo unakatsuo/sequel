@@ -6,14 +6,25 @@ module Sequel
     class Database < Sequel::Database
       include Sequel::MSSQL::DatabaseMethods
       set_adapter_scheme :tinytds
+
+      # Choose whether to use unicode strings on initialization
+      def initialize(*)
+        super
+        set_mssql_unicode_strings
+      end
       
-      # Transfer the :host and :user options to the
-      # :dataserver and :username options.
+      # Transfer the :user option to the :username option.
       def connect(server)
         opts = server_opts(server)
         opts[:username] = opts[:user]
-        set_mssql_unicode_strings
-        TinyTds::Client.new(opts)
+        c = TinyTds::Client.new(opts)
+
+        if (ts = opts[:textsize])
+          sql = "SET TEXTSIZE #{typecast_value_integer(ts)}"
+          log_yield(sql){c.execute(sql)}
+        end
+      
+        c
       end
       
       # Execute the given +sql+ on the server.  If the :return option
@@ -249,7 +260,7 @@ module Sequel
         ps.extend(PreparedStatementMethods)
         if name
           ps.prepared_statement_name = name
-          db.prepared_statements[name] = ps
+          db.set_prepared_statement(name, ps)
         end
         ps
       end
@@ -258,8 +269,8 @@ module Sequel
       
       # Properly escape the given string +v+.
       def literal_string_append(sql, v)
-        sql << 'N' if mssql_unicode_strings
-        sql << "'" << db.synchronize{|c| c.escape(v)} << "'"
+        sql << (mssql_unicode_strings ? UNICODE_STRING_START : APOS)
+        sql << db.synchronize{|c| c.escape(v)}.gsub(BACKSLASH_CRLF_RE, BACKSLASH_CRLF_REPLACE) << APOS
       end
     end
   end

@@ -9,6 +9,12 @@ describe "Model attribute setters" do
     MODEL_DB.reset
   end
 
+  specify "refresh should return self" do
+    @o = @c[1]
+    @o.stub(:_refresh).and_return([])
+    @o.refresh.should == @o
+  end
+
   it "should mark the column value as changed" do
     @o.changed_columns.should == []
 
@@ -32,6 +38,26 @@ describe "Model attribute setters" do
     @o.changed_columns.should == [:"x y"]
     @o.values.should == {:"x y"=>3}
     @o.send(:"x y").should == 3
+  end
+end
+
+describe "Model.def_column_alias" do
+  before do
+    @o = Class.new(Sequel::Model(:items)) do
+      columns :id
+      def_column_alias(:id2, :id)
+    end.load(:id=>1)
+    MODEL_DB.reset
+  end
+
+  it "should create an getter alias for the column" do
+    @o.id2.should == 1
+  end
+
+  it "should create an setter alias for the column" do
+    @o.id2 = 2
+    @o.id2.should == 2
+    @o.values.should == {:id => 2}
   end
 end
 
@@ -309,12 +335,12 @@ describe "Model.qualified_primary_key_hash" do
   end
   
   specify "should handle a single primary key" do
-    @c.qualified_primary_key_hash(1).should == {:id.qualify(:items)=>1}
+    @c.qualified_primary_key_hash(1).should == {Sequel.qualify(:items, :id)=>1}
   end
 
   specify "should handle a composite primary key" do
     @c.set_primary_key([:id1, :id2])
-    @c.qualified_primary_key_hash([1, 2]).should == {:id1.qualify(:items)=>1, :id2.qualify(:items)=>2}
+    @c.qualified_primary_key_hash([1, 2]).should == {Sequel.qualify(:items, :id1)=>1, Sequel.qualify(:items, :id2)=>2}
   end
 
   specify "should raise an error for no primary key" do
@@ -323,9 +349,57 @@ describe "Model.qualified_primary_key_hash" do
   end
 
   specify "should allow specifying a different qualifier" do
-    @c.qualified_primary_key_hash(1, :apple).should == {:id.qualify(:apple)=>1}
+    @c.qualified_primary_key_hash(1, :apple).should == {Sequel.qualify(:apple, :id)=>1}
     @c.set_primary_key([:id1, :id2])
-    @c.qualified_primary_key_hash([1, 2], :bear).should == {:id1.qualify(:bear)=>1, :id2.qualify(:bear)=>2}
+    @c.qualified_primary_key_hash([1, 2], :bear).should == {Sequel.qualify(:bear, :id1)=>1, Sequel.qualify(:bear, :id2)=>2}
+  end
+end
+
+describe "Model.db" do
+  before do
+    @db = Sequel.mock
+    @databases = Sequel::DATABASES.dup
+    @model_db = Sequel::Model.db
+    Sequel::Model.db = nil
+    Sequel::DATABASES.clear
+  end
+  after do
+    Sequel::Model.instance_variable_get(:@db).should == nil
+    Sequel::DATABASES.replace(@databases)
+    Sequel::Model.db = @model_db
+  end
+
+  specify "should be required when create named model classes" do
+    begin
+      proc{class ModelTest < Sequel::Model; end}.should raise_error(Sequel::Error)
+    ensure
+      Object.send(:remove_const, :ModelTest)
+    end
+  end
+
+  specify "should be required when creating anonymous model classes without a database" do
+    proc{Sequel::Model(:foo)}.should raise_error(Sequel::Error)
+  end
+
+  specify "should not be required when creating anonymous model classes with a database" do
+    Sequel::Model(@db).db.should == @db
+    Sequel::Model(@db[:foo]).db.should == @db
+  end
+
+  specify "should work correctly when subclassing anonymous model classes with a database" do
+    begin
+      Class.new(Sequel::Model(@db)).db.should == @db
+      Class.new(Sequel::Model(@db[:foo])).db.should == @db
+      class ModelTest < Sequel::Model(@db)
+        db.should == @db
+      end
+      class ModelTest2 < Sequel::Model(@db[:foo])
+        db.should == @db
+      end
+    ensure
+      Object.send(:remove_const, :ModelTest)
+      Object.send(:remove_const, :ModelTest2)
+    end
   end
 end
 
@@ -387,7 +461,7 @@ describe Sequel::Model, ".(allowed|restricted)_columns " do
     i.set(:x => 4, :y => 5, :z => 6)
     i.values.should == {:x => 4, :y => 5}
 
-    @c.dataset._fetch = {:x => 7}
+    @c.instance_dataset._fetch = @c.dataset._fetch = {:x => 7}
     i = @c.new
     i.update(:x => 7, :z => 9)
     i.values.should == {:x => 7}
@@ -401,7 +475,7 @@ describe Sequel::Model, ".(allowed|restricted)_columns " do
     i.set(:x => 4, :y => 5, :z => 6)
     i.values.should == {:x => 4, :y => 5}
 
-    @c.dataset._fetch = {:x => 7}
+    @c.instance_dataset._fetch = @c.dataset._fetch = {:x => 7}
     i = @c.new
     i.update(:x => 7, :z => 9)
     i.values.should == {:x => 7}
@@ -416,7 +490,7 @@ describe Sequel::Model, ".(allowed|restricted)_columns " do
     i.set(:x => 4, :y => 5, :z => 6)
     i.values.should == {:x => 4, :y => 5}
 
-    @c.dataset._fetch = {:y => 7}
+    @c.instance_dataset._fetch = @c.dataset._fetch = {:y => 7}
     i = @c.new
     i.update(:y => 7, :z => 9)
     i.values.should == {:y => 7}
@@ -534,7 +608,7 @@ describe Sequel::Model, ".[] optimization" do
     @c.simple_pk.should == '"id"'
     @c.set_primary_key :b
     @c.simple_pk.should == '"b"'
-    @c.set_primary_key :b__a.identifier
+    @c.set_primary_key Sequel.identifier(:b__a)
     @c.simple_pk.should == '"b__a"'
   end
 
@@ -590,7 +664,7 @@ describe Sequel::Model, ".[] optimization" do
 
   it "should use Dataset#with_sql if simple_table and simple_pk are true" do
     @c.set_dataset :a
-    @c.dataset._fetch = {:id => 1}
+    @c.instance_dataset._fetch = @c.dataset._fetch = {:id => 1}
     @c[1].should == @c.load(:id=>1)
     @db.sqls.should == ['SELECT * FROM "a" WHERE "id" = 1']
   end

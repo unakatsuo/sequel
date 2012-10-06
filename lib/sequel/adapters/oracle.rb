@@ -13,7 +13,10 @@ module Sequel
       # ORA-03114: not connected to ORACLE
       CONNECTION_ERROR_CODES = [ 28, 1012, 3113, 3114 ]      
       
-      ORACLE_TYPES = {:blob=>lambda{|b| Sequel::SQL::Blob.new(b.read)}}
+      ORACLE_TYPES = {
+        :blob=>lambda{|b| Sequel::SQL::Blob.new(b.read)},
+        :clob=>lambda{|b| b.read}
+      }
 
       # Hash of conversion procs for this database.
       attr_reader :conversion_procs
@@ -126,7 +129,7 @@ module Sequel
       end
 
       def execute_prepared_statement(conn, type, name, opts)
-        ps = prepared_statements[name]
+        ps = prepared_statement(name)
         sql = ps.prepared_sql
         if cursora = conn.prepared_statements[name]
           cursor, cursor_sql = cursora
@@ -136,11 +139,17 @@ module Sequel
           end
         end
         unless cursor
-          cursor = log_yield("Preparing #{name}: #{sql}"){conn.parse(sql)}
+          cursor = log_yield("PREPARE #{name}: #{sql}"){conn.parse(sql)}
           conn.prepared_statements[name] = [cursor, sql]
         end
         args = cursor_bind_params(conn, cursor, opts[:arguments])
-        r = log_yield("Executing #{name}", args){cursor.exec}
+        log_sql = "EXECUTE #{name}"
+        if ps.log_sql
+          log_sql << " ("
+          log_sql << sql
+          log_sql << ")"
+        end
+        r = log_yield(log_sql, args){cursor.exec}
         if block_given?
           yield(cursor)
         elsif type == :insert
@@ -236,9 +245,13 @@ module Sequel
         pks = ds.select_map(:cols__column_name)
 
         # Default values
-        defaults =  metadata_dataset.from(:dba_tab_cols).
-          where(:table_name=>im.call(table)).
-          to_hash(:column_name, :data_default)
+        defaults = begin
+          metadata_dataset.from(:user_tab_cols).
+            where(:table_name=>im.call(table)).
+            to_hash(:column_name, :data_default)
+        rescue DatabaseError
+          {}
+        end
 
         metadata = synchronize(opts[:server]) do |conn|
           begin
@@ -360,19 +373,6 @@ module Sequel
         ps.call(bind_vars, &block)
       end
       
-      # Prepare the given type of query with the given name and store
-      # it in the database.  Note that a new native prepared statement is
-      # created on each call to this prepared statement.
-      def prepare(type, name=nil, *values)
-        ps = to_prepared_statement(type, values)
-        ps.extend(PreparedStatementMethods)
-        if name
-          ps.prepared_statement_name = name
-          db.prepared_statements[name] = ps
-        end
-        ps
-      end
-      
       def fetch_rows(sql)
         execute(sql) do |cursor|
           offset = @opts[:offset]
@@ -393,14 +393,15 @@ module Sequel
         self
       end
 
-      # Create a named prepared statement that is stored in the
-      # database (and connection) for reuse.
+      # Prepare the given type of query with the given name and store
+      # it in the database.  Note that a new native prepared statement is
+      # created on each call to this prepared statement.
       def prepare(type, name=nil, *values)
         ps = to_prepared_statement(type, values)
         ps.extend(PreparedStatementMethods)
         if name
           ps.prepared_statement_name = name
-          db.prepared_statements[name] = ps
+          db.set_prepared_statement(name, ps)
         end
         ps
       end

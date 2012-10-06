@@ -1,5 +1,21 @@
 require File.join(File.dirname(File.expand_path(__FILE__)), "spec_helper")
 
+describe "Model#values" do
+  before do
+    @c = Class.new(Sequel::Model(:items))
+  end
+
+  it "should return the hash of model values" do
+    hash = {:x=>1}
+    @c.load(hash).values.should equal(hash)
+  end
+
+  it "should be aliased as to_hash" do
+    hash = {:x=>1}
+    @c.load(hash).to_hash.should equal(hash)
+  end
+end
+
 describe "Model#save server use" do
   before do
     @db = Sequel.mock(:autoid=>proc{|sql| 10}, :fetch=>{:x=>1, :id=>10}, :servers=>{:blah=>{}, :read_only=>{}})
@@ -26,7 +42,7 @@ describe "Model#save" do
     @c = Class.new(Sequel::Model(:items)) do
       columns :id, :x, :y
     end
-    @c.dataset.autoid = 13
+    @c.instance_dataset.autoid = @c.dataset.autoid = 13
     MODEL_DB.reset
   end
   
@@ -37,7 +53,7 @@ describe "Model#save" do
   end
 
   it "should use dataset's insert_select method if present" do
-    ds = @c.dataset = @c.dataset.clone
+    ds = @c.instance_dataset
     ds._fetch = {:y=>2}
     def ds.supports_insert_select?() true end
     def ds.insert_select(hash)
@@ -329,6 +345,58 @@ describe "Model#set_server" do
 
   it "should set the server on this if this is not already loaded" do
     @c.load(:id=>13, :x => 1).set_server(:s1).this.opts[:server].should == :s1
+  end
+end
+
+describe "Model#freeze" do
+  before do
+    class ::Album < Sequel::Model
+      columns :id
+      class B < Sequel::Model
+        columns :id, :album_id
+      end
+    end
+    @o = Album.load(:id=>1).freeze
+    MODEL_DB.sqls
+  end
+  after do
+    Object.send(:remove_const, :Album)
+  end
+
+  it "should freeze the object" do
+    @o.frozen?.should be_true
+  end
+
+  it "should freeze the object's values, associations, changed_columns, errors, and this" do
+    @o.values.frozen?.should be_true
+    @o.changed_columns.frozen?.should be_true
+    @o.errors.frozen?.should be_true
+    @o.this.frozen?.should be_true
+  end
+
+  it "should still have working class attr overriddable methods" do
+    Sequel::Model::BOOLEAN_SETTINGS.each{|m| @o.send(m) == Album.send(m)}
+  end
+
+  it "should have working new? method" do
+    @o.new?.should be_false
+    Album.new.freeze.new?.should be_true
+  end
+
+  it "should have working valid? method" do
+    @o.valid?.should be_true
+    o = Album.new
+    def o.validate() errors.add(:foo, '') end
+    o.freeze
+    o.valid?.should be_false
+  end
+
+  it "should raise an Error if trying to save/destroy/delete/refresh" do
+    proc{@o.save}.should raise_error(Sequel::Error)
+    proc{@o.destroy}.should raise_error(Sequel::Error)
+    proc{@o.delete}.should raise_error(Sequel::Error)
+    proc{@o.refresh}.should raise_error(Sequel::Error)
+    @o.db.sqls.should == []
   end
 end
 
@@ -642,40 +710,6 @@ describe "Model#pk" do
   end
 end
 
-describe "Model#pk_or_nil" do
-  before do
-    @m = Class.new(Sequel::Model)
-    @m.columns :id, :x, :y
-  end
-  
-  it "should be default return the value of the :id column" do
-    m = @m.load(:id => 111, :x => 2, :y => 3)
-    m.pk_or_nil.should == 111
-  end
-
-  it "should be return the primary key value for custom primary key" do
-    @m.set_primary_key :x
-    m = @m.load(:id => 111, :x => 2, :y => 3)
-    m.pk_or_nil.should == 2
-  end
-
-  it "should be return the primary key value for composite primary key" do
-    @m.set_primary_key [:y, :x]
-    m = @m.load(:id => 111, :x => 2, :y => 3)
-    m.pk_or_nil.should == [3, 2]
-  end
-
-  it "should raise if no primary key" do
-    @m.set_primary_key nil
-    m = @m.new(:id => 111, :x => 2, :y => 3)
-    m.pk_or_nil.should be_nil
-
-    @m.no_primary_key
-    m = @m.new(:id => 111, :x => 2, :y => 3)
-    m.pk_or_nil.should be_nil
-  end
-end
-
 describe "Model#pk_hash" do
   before do
     @m = Class.new(Sequel::Model)
@@ -896,6 +930,43 @@ describe Sequel::Model, "#set_fields" do
     @o1.values.should == {:x => 9, :y => 8, :id=>7}
     MODEL_DB.sqls.should == []
   end
+
+  it "should lookup into the hash without checking if the entry exists" do
+    @o1.set_fields({:x => 1}, [:x, :y])
+    @o1.values.should == {:x => 1, :y => nil}
+    @o1.set_fields(Hash.new(2), [:x, :y])
+    @o1.values.should == {:x => 2, :y => 2}
+  end
+
+  it "should skip missing fields if :missing=>:skip option is used" do
+    @o1.set_fields({:x => 3}, [:x, :y], :missing=>:skip)
+    @o1.values.should == {:x => 3}
+    @o1.set_fields({"x" => 4}, [:x, :y], :missing=>:skip)
+    @o1.values.should == {:x => 4}
+    @o1.set_fields(Hash.new(2).merge(:x=>2), [:x, :y], :missing=>:skip)
+    @o1.values.should == {:x => 2}
+    @o1.set_fields({:x => 1, :y => 2, :z=>3, :id=>4}, [:x, :y], :missing=>:skip)
+    @o1.values.should == {:x => 1, :y => 2}
+  end
+
+  it "should raise for missing fields if :missing=>:raise option is used" do
+    proc{@o1.set_fields({:x => 1}, [:x, :y], :missing=>:raise)}.should raise_error(Sequel::Error)
+    proc{@o1.set_fields(Hash.new(2).merge(:x=>2), [:x, :y], :missing=>:raise)}.should raise_error(Sequel::Error)
+    proc{@o1.set_fields({"x" => 1}, [:x, :y], :missing=>:raise)}.should raise_error(Sequel::Error)
+    @o1.set_fields({:x => 5, "y"=>2}, [:x, :y], :missing=>:raise)
+    @o1.values.should == {:x => 5, :y => 2}
+    @o1.set_fields({:x => 1, :y => 3, :z=>3, :id=>4}, [:x, :y], :missing=>:raise)
+    @o1.values.should == {:x => 1, :y => 3}
+  end
+
+  it "should use default behavior for an unrecognized :missing option" do
+    @o1.set_fields({:x => 1, :y => 2, :z=>3, :id=>4}, [:x, :y], :missing=>:foo)
+    @o1.values.should == {:x => 1, :y => 2}
+    @o1.set_fields({:x => 9, :y => 8, :z=>6, :id=>7}, [:x, :y, :id], :missing=>:foo)
+    @o1.values.should == {:x => 9, :y => 8, :id=>7}
+    MODEL_DB.sqls.should == []
+  end
+
 end
 
 describe Sequel::Model, "#update_fields" do
@@ -919,6 +990,16 @@ describe Sequel::Model, "#update_fields" do
     @o1.update_fields({:x => 1, :y => 5, :z=>6, :id=>7}, [:x, :y])
     @o1.values.should == {:x => 1, :y => 5, :id=>1}
     MODEL_DB.sqls.should == ["UPDATE items SET y = 5 WHERE (id = 1)"]
+  end
+
+  it "should support :missing=>:skip option" do
+    @o1.update_fields({:x => 1, :z=>3, :id=>4}, [:x, :y], :missing=>:skip)
+    @o1.values.should == {:x => 1, :id=>1}
+    MODEL_DB.sqls.should == ["UPDATE items SET x = 1 WHERE (id = 1)"]
+  end
+
+  it "should support :missing=>:raise option" do
+    proc{@o1.update_fields({:x => 1}, [:x, :y], :missing=>:raise)}.should raise_error(Sequel::Error)
   end
 end
 
@@ -998,6 +1079,35 @@ describe Sequel::Model, "#(set|update)_(all|except|only)" do
   end
 end
 
+describe Sequel::Model, "#destroy with filtered dataset" do
+  before do
+    @model = Class.new(Sequel::Model(MODEL_DB[:items].where(:a=>1)))
+    @model.columns :id, :a
+    @instance = @model.load(:id => 1234)
+    MODEL_DB.reset
+  end
+
+  it "should raise a NoExistingObject exception if the dataset delete call doesn't return 1" do
+    @instance.this.meta_def(:execute_dui){|*a| 0}
+    proc{@instance.delete}.should raise_error(Sequel::NoExistingObject)
+    @instance.this.meta_def(:execute_dui){|*a| 2}
+    proc{@instance.delete}.should raise_error(Sequel::NoExistingObject)
+    @instance.this.meta_def(:execute_dui){|*a| 1}
+    proc{@instance.delete}.should_not raise_error
+    
+    @instance.require_modification = false
+    @instance.this.meta_def(:execute_dui){|*a| 0}
+    proc{@instance.delete}.should_not raise_error
+    @instance.this.meta_def(:execute_dui){|*a| 2}
+    proc{@instance.delete}.should_not raise_error
+  end
+
+  it "should include WHERE clause when deleting" do
+    @instance.destroy
+    MODEL_DB.sqls.should == ["DELETE FROM items WHERE ((a = 1) AND (id = 1234))"]
+  end
+end
+
 describe Sequel::Model, "#destroy" do
   before do
     @model = Class.new(Sequel::Model(:items))
@@ -1012,56 +1122,56 @@ describe Sequel::Model, "#destroy" do
   end
   
   it "should raise a NoExistingObject exception if the dataset delete call doesn't return 1" do
-    @instance.this.meta_def(:delete){|*a| 0}
+    @model.dataset.meta_def(:execute_dui){|*a| 0}
     proc{@instance.delete}.should raise_error(Sequel::NoExistingObject)
-    @instance.this.meta_def(:delete){|*a| 2}
+    @model.dataset.meta_def(:execute_dui){|*a| 2}
     proc{@instance.delete}.should raise_error(Sequel::NoExistingObject)
-    @instance.this.meta_def(:delete){|*a| 1}
+    @model.dataset.meta_def(:execute_dui){|*a| 1}
     proc{@instance.delete}.should_not raise_error
     
     @instance.require_modification = false
-    @instance.this.meta_def(:delete){|*a| 0}
+    @model.dataset.meta_def(:execute_dui){|*a| 0}
     proc{@instance.delete}.should_not raise_error
-    @instance.this.meta_def(:delete){|*a| 2}
+    @model.dataset.meta_def(:execute_dui){|*a| 2}
     proc{@instance.delete}.should_not raise_error
   end
 
   it "should run within a transaction if use_transactions is true" do
     @instance.use_transactions = true
     @instance.destroy
-    MODEL_DB.sqls.should == ["BEGIN", "DELETE FROM items WHERE (id = 1234)", "COMMIT"]
+    MODEL_DB.sqls.should == ["BEGIN", "DELETE FROM items WHERE id = 1234", "COMMIT"]
   end
 
   it "should not run within a transaction if use_transactions is false" do
     @instance.use_transactions = false
     @instance.destroy
-    MODEL_DB.sqls.should == ["DELETE FROM items WHERE (id = 1234)"]
+    MODEL_DB.sqls.should == ["DELETE FROM items WHERE id = 1234"]
   end
 
   it "should run within a transaction if :transaction option is true" do
     @instance.use_transactions = false
     @instance.destroy(:transaction => true)
-    MODEL_DB.sqls.should == ["BEGIN", "DELETE FROM items WHERE (id = 1234)", "COMMIT"]
+    MODEL_DB.sqls.should == ["BEGIN", "DELETE FROM items WHERE id = 1234", "COMMIT"]
   end
 
   it "should not run within a transaction if :transaction option is false" do
     @instance.use_transactions = true
     @instance.destroy(:transaction => false)
-    MODEL_DB.sqls.should == ["DELETE FROM items WHERE (id = 1234)"]
+    MODEL_DB.sqls.should == ["DELETE FROM items WHERE id = 1234"]
   end
 
   it "should run before_destroy and after_destroy hooks" do
     @model.send(:define_method, :before_destroy){MODEL_DB.execute('before blah')}
     @model.send(:define_method, :after_destroy){MODEL_DB.execute('after blah')}
     @instance.destroy
-    MODEL_DB.sqls.should == ["before blah", "DELETE FROM items WHERE (id = 1234)", "after blah"]
+    MODEL_DB.sqls.should == ["before blah", "DELETE FROM items WHERE id = 1234", "after blah"]
   end
 end
 
 describe Sequel::Model, "#exists?" do
   before do
     @model = Class.new(Sequel::Model(:items))
-    @model.dataset._fetch = proc{|sql| {:x=>1} if sql =~ /id = 1/}
+    @model.instance_dataset._fetch = @model.dataset._fetch = proc{|sql| {:x=>1} if sql =~ /id = 1/}
     MODEL_DB.reset
   end
 
@@ -1369,7 +1479,7 @@ describe Sequel::Model, "#refresh" do
   specify "should reload the instance values from the database" do
     @m = @c.new(:id => 555)
     @m[:x] = 'blah'
-    @c.dataset._fetch = {:x => 'kaboom', :id => 555}
+    @c.instance_dataset._fetch = @c.dataset._fetch = {:x => 'kaboom', :id => 555}
     @m.refresh
     @m[:x].should == 'kaboom'
     MODEL_DB.sqls.should == ["SELECT * FROM items WHERE (id = 555) LIMIT 1"]
@@ -1377,25 +1487,17 @@ describe Sequel::Model, "#refresh" do
   
   specify "should raise if the instance is not found" do
     @m = @c.new(:id => 555)
-    @c.dataset._fetch = []
+    @c.instance_dataset._fetch =@c.dataset._fetch = []
     proc {@m.refresh}.should raise_error(Sequel::Error)
     MODEL_DB.sqls.should == ["SELECT * FROM items WHERE (id = 555) LIMIT 1"]
   end
   
   specify "should be aliased by #reload" do
     @m = @c.new(:id => 555)
-    @c.dataset._fetch = {:x => 'kaboom', :id => 555}
+    @c.instance_dataset._fetch =@c.dataset._fetch = {:x => 'kaboom', :id => 555}
     @m.reload
     @m[:x].should == 'kaboom'
     MODEL_DB.sqls.should == ["SELECT * FROM items WHERE (id = 555) LIMIT 1"]
-  end
-
-  specify "should remove cached associations" do
-    @c.many_to_one :node, :class=>@c
-    @m = @c.new(:id => 555)
-    @m.associations[:node] = 15
-    @m.reload
-    @m.associations.should == {}
   end
 end
 
@@ -1451,6 +1553,15 @@ describe Sequel::Model, "typecasting" do
     proc{m.x = ''}.should raise_error
     @c.typecast_empty_string_to_nil = false
     proc{@c.new.x = ''}.should raise_error
+  end
+
+  specify "should handle typecasting where == raises an error on the object" do
+    m = @c.new
+    o = Object.new
+    def o.==(v) raise ArgumentError end
+    def o.to_i() 4 end
+    m.x = o
+    m.x.should == 4
   end
 
   specify "should not typecast nil if NULLs are allowed" do

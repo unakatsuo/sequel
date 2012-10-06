@@ -61,6 +61,16 @@ module Sequel
       false
     end
 
+    # Whether the dataset supports CUBE with GROUP BY.
+    def supports_group_cube?
+      false
+    end
+
+    # Whether the dataset supports ROLLUP with GROUP BY.
+    def supports_group_rollup?
+      false
+    end
+
     # Whether this dataset supports the +insert_select+ method for returning all columns values
     # directly from an insert query.
     def supports_insert_select?
@@ -104,6 +114,11 @@ module Sequel
       supports_distinct_on?
     end
     
+    # Whether the dataset supports pattern matching by regular expressions.
+    def supports_regexp?
+      false
+    end
+
     # Whether the RETURNING clause is supported for the given type of query.
     # +type+ can be :insert, :update, or :delete.
     def supports_returning?(type)
@@ -154,6 +169,11 @@ module Sequel
     # +type+ can be :insert, :update, or :delete.
     def uses_returning?(type)
       opts[:returning] && !@opts[:sql] && supports_returning?(type)
+    end
+    
+    # Whether the dataset uses WITH ROLLUP/CUBE instead of ROLLUP()/CUBE().
+    def uses_with_rollup?
+      false
     end
   end
 end

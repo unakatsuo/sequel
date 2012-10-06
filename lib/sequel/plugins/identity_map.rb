@@ -58,7 +58,7 @@ module Sequel
             left_key_alias = opts[:left_key_alias] ||= opts.default_associated_key_alias
             opts[:eager_loader] = lambda do |eo|
               return el.call(eo) unless model.identity_map
-              h = eo[:key_hash][left_pk]
+              h = eo[:id_map]
               eo[:rows].each{|object| object.associations[name] = []}
               r = uses_rcks ? rcks.zip(opts.right_primary_keys) : [[right, opts.right_primary_key]]
               l = uses_lcks ? [[lcks.map{|k| SQL::QualifiedIdentifier.new(join_table, k)}, h.keys]] : [[left, h.keys]]
@@ -107,11 +107,11 @@ module Sequel
             left_key_alias = opts[:left_key_alias]
             opts[:eager_loader] = lambda do |eo|
               return el.call(eo) unless model.identity_map
-              h = eo[:key_hash][left_pk]
+              h = eo[:id_map]
               eo[:rows].each{|object| object.associations[name] = []}
               ds = opts.associated_class 
               opts.reverse_edges.each{|t| ds = ds.join(t[:table], Array(t[:left]).zip(Array(t[:right])), :table_alias=>t[:alias])}
-              ft = opts[:final_reverse_edge]
+              ft = opts.final_reverse_edge
               conds = uses_lcks ? [[left_keys.map{|k| SQL::QualifiedIdentifier.new(ft[:table], k)}, h.keys]] : [[left_key, h.keys]]
 
               # See above comment in many_to_many eager_loader
@@ -153,7 +153,8 @@ module Sequel
         # The identity map key for an object of the current class with the given pk.
         # May not always be correct for a class which uses STI.
         def identity_map_key(pk)
-          "#{self}:#{pk ? Array(pk).join(',') : "nil:#{rand}"}"
+          pk = Array(pk)
+          "#{self}:#{pk.join(',')}" unless pk.compact.empty?
         end
 
         # If the identity map is in use, check it for a current copy of the object.
@@ -164,12 +165,14 @@ module Sequel
         # fields and request other, potentially overlapping fields in a new query,
         # and not have the second query override fields you modified.
         def call(row)
-          return super unless idm = identity_map
-          if o = idm[identity_map_key(Array(primary_key).map{|x| row[x]})]
+          return super unless (idm = identity_map) && (pk = primary_key)
+          if (k = identity_map_key(Array(pk).map{|x| row[x]})) && (o = idm[k])
             o.merge_db_update(row)
           else
             o = super
-            idm[identity_map_key(o.pk)] = o
+            if (k = identity_map_key(o.pk))
+              idm[k] = o
+            end
           end
           o
         end
@@ -196,7 +199,7 @@ module Sequel
         # Check the current identity map if it exists for the object with
         # the matching pk.  If one is found, return it, otherwise call super.
         def primary_key_lookup(pk)
-          (idm = identity_map and o = idm[identity_map_key(pk)]) ? o : super
+          ((idm = identity_map) && (k = identity_map_key(pk)) && (o = idm[k])) ? o : super
         end
       end
 
@@ -204,8 +207,8 @@ module Sequel
         # Remove instances from the identity map cache if they are deleted.
         def delete
           super
-          if idm = model.identity_map
-            idm.delete(model.identity_map_key(pk))
+          if (idm = model.identity_map) && (k = model.identity_map_key(pk))
+            idm.delete(k)
           end
           self
         end
@@ -228,10 +231,19 @@ module Sequel
         # key option has a value and the association uses the primary key of
         # the associated class as the :primary_key option, check the identity
         # map for the associated object and return it if present.
-        def _load_associated_objects(opts, dynamic_opts={})
+        def _load_associated_object(opts, dynamic_opts)
           klass = opts.associated_class
-          if !dynamic_opts[:callback] && klass.respond_to?(:identity_map) && idm = klass.identity_map and opts[:type] == :many_to_one and opts.primary_key == klass.primary_key and
-           opts[:key] and pk = _associated_object_pk(opts[:key]) and o = idm[klass.identity_map_key(pk)]
+          cache_lookup = opts.fetch(:idm_cache_lookup) do 
+            opts[:idm_cache_lookup] = klass.respond_to?(:identity_map) &&
+              opts[:type] == :many_to_one &&
+              opts[:key] &&
+              opts.primary_key == klass.primary_key
+          end
+          if cache_lookup &&
+            !dynamic_opts[:callback] &&
+            (idm = klass.identity_map) &&
+            (k = klass.identity_map_key(_associated_object_pk(opts[:key]))) && 
+            (o = idm[k])
             o
           else
             super

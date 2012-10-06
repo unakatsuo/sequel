@@ -1,6 +1,5 @@
 require File.join(File.dirname(File.expand_path(__FILE__)), 'spec_helper.rb')
 
-if INTEGRATION_DB.respond_to?(:schema_parse_table, true)
 describe "Database schema parser" do
   before do
     @iom = INTEGRATION_DB.identifier_output_method
@@ -13,7 +12,7 @@ describe "Database schema parser" do
     INTEGRATION_DB.identifier_input_method = @iim
     INTEGRATION_DB.default_schema = @defsch
     INTEGRATION_DB.quote_identifiers = @qi
-    INTEGRATION_DB.drop_table(:items) if INTEGRATION_DB.table_exists?(:items)
+    INTEGRATION_DB.drop_table?(:items)
   end
 
   specify "should handle a database with a identifier methods" do
@@ -109,6 +108,16 @@ describe "Database schema parser" do
     INTEGRATION_DB.schema(:items).first.last[:ruby_default].should == 'blah'
   end
 
+  specify "should parse current timestamp defaults from the schema properly" do
+    INTEGRATION_DB.create_table!(:items){Time :a, :default=>Sequel::CURRENT_TIMESTAMP}
+    INTEGRATION_DB.schema(:items).first.last[:ruby_default].should == Sequel::CURRENT_TIMESTAMP
+  end
+
+  cspecify "should parse current date defaults from the schema properly", :mysql, :oracle do
+    INTEGRATION_DB.create_table!(:items){Date :a, :default=>Sequel::CURRENT_DATE}
+    INTEGRATION_DB.schema(:items).first.last[:ruby_default].should == Sequel::CURRENT_DATE
+  end
+
   cspecify "should parse types from the schema properly", [:jdbc, :db2], :oracle do
     INTEGRATION_DB.create_table!(:items){Integer :number}
     INTEGRATION_DB.schema(:items).first.last[:type].should == :integer
@@ -137,17 +146,20 @@ describe "Database schema parser" do
     INTEGRATION_DB.create_table!(:items){FalseClass :number}
     INTEGRATION_DB.schema(:items).first.last[:type].should == :boolean
   end
-end
-end
+end if INTEGRATION_DB.respond_to?(:schema_parse_table, true)
 
-begin
-  INTEGRATION_DB.drop_table(:blah) rescue nil
+test_indexes = begin
+  INTEGRATION_DB.drop_table?(:blah)
   INTEGRATION_DB.indexes(:blah)
+  true
 rescue Sequel::NotImplemented
+  false
 rescue
+  true
+end
 describe "Database index parsing" do
   after do
-    INTEGRATION_DB.drop_table(:items)
+    INTEGRATION_DB.drop_table?(:items)
   end
 
   specify "should parse indexes into a hash" do
@@ -173,8 +185,63 @@ describe "Database index parsing" do
     INTEGRATION_DB.create_table!(:items){Integer :n; Integer :a; primary_key [:n, :a]}
     INTEGRATION_DB.indexes(:items).should == {}
   end
+end if test_indexes
+
+test_foreign_key_list = begin
+  INTEGRATION_DB.drop_table?(:blah)
+  INTEGRATION_DB.foreign_key_list(:blah)
+  true
+rescue Sequel::NotImplemented
+  false
+rescue
+  true
 end
-end
+describe "Database foreign key parsing" do
+  before do
+    @db = INTEGRATION_DB
+    @pr = lambda do |table, *expected|
+      actual = @db.foreign_key_list(table).sort_by{|c| c[:columns].map{|s| s.to_s}.join << (c[:key]||[]).map{|s| s.to_s}.join}.map{|v| v.values_at(:columns, :table, :key)}
+      actual.zip(expected).each do |a, e|
+        if e.last.first == :pk
+          if a.last == nil
+            a.pop
+            e.pop
+          else
+           e.last.shift
+          end
+        end
+        a.should == e
+      end
+      actual.length.should == expected.length
+    end
+  end
+  after do
+    @db.drop_table?(:b, :a)
+  end
+
+  specify "should parse foreign key information into an array of hashes" do
+    @db.create_table!(:a, :engine=>:InnoDB){primary_key :c; Integer :d; index :d, :unique=>true}
+    @db.create_table!(:b, :engine=>:InnoDB){foreign_key :e, :a}
+    @pr[:a]
+    @pr[:b, [[:e], :a, [:pk, :c]]]
+
+    @db.alter_table(:b){add_foreign_key :f, :a, :key=>[:d]}
+    @pr[:b, [[:e], :a, [:pk, :c]], [[:f], :a, [:d]]]
+
+    @db.alter_table(:b){add_foreign_key [:f], :a, :key=>[:c]}
+    @pr[:b, [[:e], :a, [:pk, :c]], [[:f], :a, [:c]], [[:f], :a, [:d]]]
+
+    @db.alter_table(:a){add_index [:d, :c], :unique=>true}
+    @db.alter_table(:b){add_foreign_key [:f, :e], :a, :key=>[:d, :c]}
+    @pr[:b, [[:e], :a, [:pk, :c]], [[:f], :a, [:c]], [[:f], :a, [:d]], [[:f, :e], :a, [:d, :c]]]
+  end
+
+  specify "should handle composite foreign and primary keys" do
+    @db.create_table!(:a, :engine=>:InnoDB){Integer :b; Integer :c; primary_key [:b, :c]; index [:c, :b], :unique=>true}
+    @db.create_table!(:b, :engine=>:InnoDB){Integer :e; Integer :f; foreign_key [:e, :f], :a; foreign_key [:f, :e], :a, :key=>[:c, :b]}
+    @pr[:b, [[:e, :f], :a, [:pk, :b, :c]], [[:f, :e], :a, [:c, :b]]]
+  end
+end if test_foreign_key_list
 
 describe "Database schema modifiers" do
   before do
@@ -182,7 +249,9 @@ describe "Database schema modifiers" do
     @ds = @db[:items]
   end
   after do
-    @db.drop_table(:items) if @db.table_exists?(:items)
+    # Use instead of drop_table? to work around issues on jdbc/db2
+    @db.drop_table(:items) rescue nil
+    @db.drop_table(:items2) rescue nil
   end
 
   specify "should create tables correctly" do
@@ -193,6 +262,36 @@ describe "Database schema modifiers" do
     @ds.columns!.should == [:number]
   end
   
+  specify "should create tables from select statements correctly" do
+    @db.create_table!(:items){Integer :number}
+    @ds.insert([10])
+    @db.create_table(:items2, :as=>@db[:items])
+    @db.schema(:items2, :reload=>true).map{|x| x.first}.should == [:number]
+    @db[:items2].columns.should == [:number]
+    @db[:items2].all.should == [{:number=>10}]
+  end
+  
+  specify "should handle create table in a rolled back transaction" do
+    @db.drop_table?(:items)
+    @db.transaction(:rollback=>:always){@db.create_table(:items){Integer :number}}
+    @db.table_exists?(:items).should be_false
+  end if INTEGRATION_DB.supports_transactional_ddl?
+  
+  describe "join tables" do
+    after do
+      @db.drop_join_table(:cat_id=>:cats, :dog_id=>:dogs) if @db.table_exists?(:cats_dogs)
+      @db.drop_table(:cats, :dogs)
+      @db.table_exists?(:cats_dogs).should == false
+    end
+
+    specify "should create join tables correctly" do
+      @db.create_table!(:cats){primary_key :id}
+      @db.create_table!(:dogs){primary_key :id}
+      @db.create_join_table(:cat_id=>:cats, :dog_id=>:dogs)
+      @db.table_exists?(:cats_dogs).should == true
+    end
+  end
+
   specify "should create temporary tables without raising an exception" do
     @db.create_table!(:items, :temp=>true){Integer :number}
   end
@@ -201,7 +300,7 @@ describe "Database schema modifiers" do
     @db.create_table!(:items){String :a}
     @db.create_table?(:items){String :b}
     @db[:items].columns.should == [:a]
-    @db.drop_table(:items) rescue nil
+    @db.drop_table?(:items)
     @db.create_table?(:items){String :b}
     @db[:items].columns.should == [:b]
   end
@@ -210,13 +309,13 @@ describe "Database schema modifiers" do
     @db.create_table!(:items){String :a, :index=>true}
     @db.create_table?(:items){String :b, :index=>true}
     @db[:items].columns.should == [:a]
-    @db.drop_table(:items) rescue nil
+    @db.drop_table?(:items)
     @db.create_table?(:items){String :b, :index=>true}
     @db[:items].columns.should == [:b]
   end
 
   specify "should rename tables correctly" do
-    @db.drop_table(:items) rescue nil
+    @db.drop_table?(:items)
     @db.create_table!(:items2){Integer :number}
     @db.rename_table(:items2, :items)
     @db.table_exists?(:items).should == true
@@ -320,6 +419,17 @@ describe "Database schema modifiers" do
     proc{@ds.insert(:n=>nil)}.should raise_error(Sequel::DatabaseError)
   end
 
+  specify "should rename columns when the table is referenced by a foreign key" do
+    @db.create_table!(:items2){primary_key :id; Integer :a}
+    @db.create_table!(:items){Integer :id, :primary_key=>true; foreign_key :items_id, :items2}
+    @db[:items2].insert(:a=>10)
+    @ds.insert(:id=>1)
+    @db.alter_table(:items2){rename_column :a, :b}
+    @db[:items2].insert(:b=>20)
+    @ds.insert(:id=>2)
+    @db[:items2].select_order_map([:id, :b]).should == [[1, 10], [2, 20]]
+  end
+
   cspecify "should set column NULL/NOT NULL correctly", [:jdbc, :db2], [:db2] do
     @db.create_table!(:items, :engine=>:InnoDB){Integer :id}
     @ds.insert(:id=>10)
@@ -350,6 +460,35 @@ describe "Database schema modifiers" do
     @ds.columns!.should == [:id]
     @ds.insert(:id=>'20')
     @ds.all.should == [{:id=>"10"}, {:id=>"20"}]
+  end
+
+  cspecify "should set column types without modifying NULL/NOT NULL", [:jdbc, :db2], [:db2], :oracle, :derby do
+    @db.create_table!(:items){Integer :id, :null=>false, :default=>2}
+    proc{@ds.insert(:id=>nil)}.should raise_error(Sequel::DatabaseError)
+    @db.alter_table(:items){set_column_type :id, String}
+    proc{@ds.insert(:id=>nil)}.should raise_error(Sequel::DatabaseError)
+
+    @db.create_table!(:items){Integer :id}
+    @ds.insert(:id=>nil)
+    @db.alter_table(:items){set_column_type :id, String}
+    @ds.insert(:id=>nil)
+    @ds.map(:id).should == [nil, nil]
+  end
+
+  cspecify "should set column types without modifying defaults", [:jdbc, :db2], [:db2], :oracle, :derby do
+    @db.create_table!(:items){Integer :id, :default=>0}
+    @ds.insert
+    @ds.map(:id).should == [0]
+    @db.alter_table(:items){set_column_type :id, String}
+    @ds.insert
+    @ds.map(:id).should == ['0', '0']
+
+    @db.create_table!(:items){String :id, :default=>'a'}
+    @ds.insert
+    @ds.map(:id).should == %w'a'
+    @db.alter_table(:items){set_column_type :id, String, :size=>1}
+    @ds.insert
+    @ds.map(:id).should == %w'a a'
   end
 
   specify "should add unnamed unique constraints and foreign key table constraints correctly" do
@@ -395,28 +534,40 @@ describe "Database schema modifiers" do
     proc{@ds.insert(1, 2)}.should_not raise_error
   end
 
-  cspecify "should remove columns from tables correctly", :h2, :mssql, [:jdbc, :db2], :hsqldb do
+  specify "should remove columns from tables correctly" do
     @db.create_table!(:items) do
       primary_key :id
-      String :name
-      Integer :number
-      foreign_key :item_id, :items
+      Integer :i
     end
-    @ds.insert(:number=>10)
-    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :name, :number, :item_id]
-    @ds.columns!.should == [:id, :name, :number, :item_id]
-    @db.drop_column(:items, :number)
-    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :name, :item_id]
-    @ds.columns!.should == [:id, :name, :item_id]
-    @db.drop_column(:items, :name)
-    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :item_id]
-    @ds.columns!.should == [:id, :item_id]
-    @db.drop_column(:items, :item_id)
+    @ds.insert(:i=>10)
+    @db.drop_column(:items, :i)
     @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id]
-    @ds.columns!.should == [:id]
   end
 
-  cspecify "should remove multiple columns in a single alter_table block", [:jdbc, :db2] do
+  specify "should remove columns with defaults from tables correctly" do
+    @db.create_table!(:items) do
+      primary_key :id
+      Integer :i, :default=>20
+    end
+    @ds.insert(:i=>10)
+    @db.drop_column(:items, :i)
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id]
+  end
+
+  cspecify "should remove foreign key columns from tables correctly", :h2, :mssql, :hsqldb do
+    # MySQL with InnoDB cannot drop foreign key columns unless you know the
+    # name of the constraint, see Bug #14347
+    @db.create_table!(:items, :engine=>:MyISAM) do
+      primary_key :id
+      Integer :i
+      foreign_key :item_id, :items
+    end
+    @ds.insert(:i=>10)
+    @db.drop_column(:items, :item_id)
+    @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :i]
+  end
+
+  specify "should remove multiple columns in a single alter_table block" do
     @db.create_table!(:items) do
       primary_key :id
       String :name
@@ -424,20 +575,44 @@ describe "Database schema modifiers" do
     end
     @ds.insert(:number=>10)
     @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id, :name, :number]
-    @ds.columns!.should == [:id, :name, :number]
     @db.alter_table(:items) do
       drop_column :name
       drop_column :number
     end
     @db.schema(:items, :reload=>true).map{|x| x.first}.should == [:id]
-    @ds.columns!.should == [:id]
+  end
+
+  cspecify "should work correctly with many operations in a single alter_table call", [:jdbc, :db2], [:db2] do
+    @db.create_table!(:items) do
+      primary_key :id
+      String :name2
+      String :number2
+      constraint :bar, Sequel.~(:id=>nil)
+    end
+    @ds.insert(:name2=>'A12')
+    @db.alter_table(:items) do
+      add_column :number, Integer
+      drop_column :number2
+      rename_column :name2, :name
+      drop_constraint :bar
+      set_column_not_null :name
+      set_column_default :name, 'A13'
+      add_constraint :foo, Sequel.like(:name, 'A%')
+    end
+    @db[:items].first.should == {:id=>1, :name=>'A12', :number=>nil}
+    @db[:items].delete
+    proc{@db[:items].insert(:name=>nil)}.should raise_error(Sequel::DatabaseError)
+    @db[:items].insert(:number=>1)
+    @db[:items].get(:name).should == 'A13'
   end
 end
 
-begin
+test_tables = begin
   INTEGRATION_DB.tables
+  true
 rescue Sequel::NotImplemented
-rescue
+  false
+end
 describe "Database#tables" do
   before do
     class ::String
@@ -472,13 +647,14 @@ describe "Database#tables" do
     @db.identifier_input_method = :xxxxx
     @db.tables.each{|t| t.to_s.should =~ /\Ax{5}\d+\z/}
   end
-end
-end
+end if test_tables
 
-begin
+test_views = begin
   INTEGRATION_DB.views
+  true
 rescue Sequel::NotImplemented
-rescue
+  false
+end
 describe "Database#views" do
   before do
     class ::String
@@ -513,5 +689,4 @@ describe "Database#views" do
     @db.identifier_input_method = :xxxxx
     @db.views.each{|t| t.to_s.should =~ /\Ax{5}\d+\z/}
   end
-end
-end
+end if test_views

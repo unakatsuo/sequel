@@ -60,11 +60,12 @@ module Sequel
         def metadata_dataset
           super.extend(MetadataDatasetMethods)
         end
-      end
-      
-      # Dataset class for SQLServer datasets accessed via JDBC.
-      class Dataset < JDBC::Dataset
-        include Sequel::MSSQL::DatasetMethods
+
+        private
+
+        def disconnect_error?(exception, opts)
+          super || (exception.message =~ /connection is closed/)
+        end
       end
     end
   end

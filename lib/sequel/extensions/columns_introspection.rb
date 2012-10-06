@@ -5,9 +5,17 @@
 # This method is not fool-proof, it's possible that some databases
 # will use column names that Sequel does not expect.
 #
-# To enable this for a single dataset, extend the dataset with
-# Sequel::ColumnIntrospection.  To enable this for all datasets, run:
+# To attempt to introspect columns for a single dataset:
 #
+#   ds.extension(:columns_introspection)
+#
+# To attempt to introspect columns for all datasets on a single database:
+#
+#   DB.extension(:columns_introspection)
+#
+# To attempt to introspect columns for all datasets on all databases:
+#
+#   Sequel.extension :columns_introspection
 #   Sequel::Dataset.introspect_all_columns
 
 module Sequel
@@ -58,4 +66,7 @@ module Sequel
       remove_method(:columns) if instance_methods(false).map{|x| x.to_s}.include?('columns')
     end
   end
+
+  Dataset.register_extension(:columns_introspection, Sequel::ColumnsIntrospection)
 end
+

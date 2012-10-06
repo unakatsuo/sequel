@@ -6,6 +6,8 @@ module Sequel
     module Derby
       # Instance methods for Derby Database objects accessed via JDBC.
       module DatabaseMethods
+        PRIMARY_KEY_INDEX_RE = /\Asql\d+\z/i.freeze
+
         include ::Sequel::JDBC::Transactions
 
         # Derby doesn't support casting integer to varchar, only integer to char,
@@ -35,8 +37,19 @@ module Sequel
           end
         end
         
+        # Derby supports transaction DDL statements.
+        def supports_transactional_ddl?
+          true
+        end
+
         private
         
+        # Derby optimizes away Sequel's default check of SELECT NULL FROM table,
+        # so use a SELECT * FROM table there.
+        def _table_exists?(ds)
+          ds.first
+        end
+    
         # Derby-specific syntax for renaming columns and changing a columns type/nullity.
         def alter_table_sql(table, op)
           case op[:op]
@@ -62,10 +75,30 @@ module Sequel
           sql << " NOT NULL" if column.fetch(:null, column[:allow_null]) == false
         end
     
-        # Temporary table creation on Derby use DECLARE instead of CREATE.
+        # Add NOT LOGGED for temporary tables to improve performance.
         def create_table_sql(name, generator, options)
+          s = super
+          s << ' NOT LOGGED' if options[:temp]
+          s
+        end
+
+        # Insert data from the current table into the new table after
+        # creating the table, since it is not possible to do it in one step.
+        def create_table_as(name, sql, options)
+          super
+          from(name).insert(sql.is_a?(Dataset) ? sql : dataset.with_sql(sql))
+        end
+
+        # Derby currently only requires WITH NO DATA, with a separate insert
+        # to import data.
+        def create_table_as_sql(name, sql, options)
+          "#{create_table_prefix_sql(name, options)} AS #{sql} WITH NO DATA"
+        end
+
+        # Temporary table creation on Derby uses DECLARE instead of CREATE.
+        def create_table_prefix_sql(name, options)
           if options[:temp]
-            "DECLARE GLOBAL TEMPORARY TABLE #{quote_identifier(name)} (#{column_list_sql(generator)}) NOT LOGGED"
+            "DECLARE GLOBAL TEMPORARY TABLE #{quote_identifier(name)}"
           else
             super
           end
@@ -81,9 +114,19 @@ module Sequel
           end
         end
 
+        # Handle nil values by using setNull with the correct parameter type.
+        def set_ps_arg_nil(cps, i)
+          cps.setNull(i, cps.getParameterMetaData.getParameterType(i))
+        end
+      
         # Derby uses RENAME TABLE syntax to rename tables.
         def rename_table_sql(name, new_name)
           "RENAME TABLE #{quote_schema_table(name)} TO #{quote_schema_table(new_name)}"
+        end
+
+        # Primary key indexes appear to be named sqlNNNN on Derby
+        def primary_key_index_re
+          PRIMARY_KEY_INDEX_RE
         end
 
         # If an :identity option is present in the column, add the necessary IDENTITY SQL.
@@ -99,6 +142,11 @@ module Sequel
           else
             super
           end
+        end
+
+        # Derby uses clob for text types.
+        def uses_clob_for_text?
+          true
         end
       end
       
@@ -118,20 +166,18 @@ module Sequel
         ROWS = " ROWS".freeze
         FETCH_FIRST = " FETCH FIRST ".freeze
         ROWS_ONLY = " ROWS ONLY".freeze
-        BOOL_TRUE = '(1 = 1)'.freeze
-        BOOL_FALSE = '(1 = 0)'.freeze
+        BOOL_TRUE_OLD = '(1 = 1)'.freeze
+        BOOL_FALSE_OLD = '(1 = 0)'.freeze
+        BOOL_TRUE = 'TRUE'.freeze
+        BOOL_FALSE = 'FALSE'.freeze
         SELECT_CLAUSE_METHODS = clause_methods(:select, %w'select distinct columns from join where group having compounds order limit lock')
+        EMULATED_FUNCTION_MAP = {:char_length=>'length'.freeze}
 
         # Derby doesn't support an expression between CASE and WHEN,
-        # so emulate it by using an equality statement for all of the
+        # so remove 
         # conditions.
         def case_expression_sql_append(sql, ce)
-          if ce.expression?
-            e = ce.expression
-            case_expression_sql_append(sql, ::Sequel::SQL::CaseExpression.new(ce.conditions.map{|c, r| [::Sequel::SQL::BooleanExpression.new(:'=', e, c), r]}, ce.default))
-          else
-            super
-          end
+          super(sql, ce.with_merged_expression)
         end
 
         # If the type is String, trim the extra spaces since CHAR is used instead
@@ -154,6 +200,8 @@ module Sequel
             super(sql, :LIKE, [SQL::Function.new(:upper, args.at(0)), SQL::Function.new(:upper, args.at(1))])
           when :"NOT ILIKE"
             super(sql, :"NOT LIKE", [SQL::Function.new(:upper, args.at(0)), SQL::Function.new(:upper, args.at(1))])
+          when :%
+            sql << complex_expression_arg_pairs(args){|a, b| "MOD(#{literal(a)}, #{literal(b)})"}
           when :&, :|, :^, :<<, :>>
             raise Error, "Derby doesn't support the #{op} operator"
           when :'B~'
@@ -169,6 +217,11 @@ module Sequel
           end
         end
 
+        # Derby supports GROUP BY ROLLUP (but not CUBE)
+        def supports_group_rollup?
+          true
+        end
+
         # Derby does not support IS TRUE.
         def supports_is_true?
           false
@@ -181,6 +234,23 @@ module Sequel
 
         private
 
+        JAVA_SQL_CLOB         = Java::JavaSQL::Clob
+
+        class ::Sequel::JDBC::Dataset::TYPE_TRANSLATOR
+          def derby_clob(v) v.getSubString(1, v.length) end
+        end
+
+        DERBY_CLOB_METHOD = TYPE_TRANSLATOR_INSTANCE.method(:derby_clob)
+      
+        # Handle clobs on Derby as strings.
+        def convert_type_proc(v)
+          if v.is_a?(JAVA_SQL_CLOB)
+            DERBY_CLOB_METHOD
+          else
+            super
+          end
+        end
+        
         # Derby needs a hex string casted to BLOB for blobs.
         def literal_blob_append(sql, v)
           sql << BLOB_OPEN << v.unpack(HSTAR).first << BLOB_CLOSE
@@ -195,7 +265,11 @@ module Sequel
         # Derby uses an expression yielding false for false values.
         # Newer versions can use the FALSE literal, but the latest gem version cannot.
         def literal_false
-          BOOL_FALSE
+          if db.svn_version >= 1040133
+            BOOL_FALSE
+          else
+            BOOL_FALSE_OLD
+          end
         end
 
         # Derby handles fractional seconds in timestamps, but not in times
@@ -206,7 +280,11 @@ module Sequel
         # Derby uses an expression yielding true for true values.
         # Newer versions can use the TRUE literal, but the latest gem version cannot.
         def literal_true
-          BOOL_TRUE
+          if db.svn_version >= 1040133
+            BOOL_TRUE
+          else
+            BOOL_TRUE_OLD
+          end
         end
 
         # Derby doesn't support common table expressions.

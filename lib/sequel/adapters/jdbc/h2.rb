@@ -25,7 +25,7 @@ module Sequel
 
         # H2 uses an IDENTITY type
         def serial_primary_key_options
-          {:primary_key => true, :type => :identity}
+          {:primary_key => true, :type => :identity, :identity=>true}
         end
 
         # H2 supports CREATE TABLE IF NOT EXISTS syntax.
@@ -48,7 +48,7 @@ module Sequel
         # If the :prepare option is given and we aren't in a savepoint,
         # prepare the transaction for a two-phase commit.
         def commit_transaction(conn, opts={})
-          if (s = opts[:prepare]) && @transactions[conn][:savepoint_level] <= 1
+          if (s = opts[:prepare]) && _trans(conn)[:savepoint_level] <= 1
             log_connection_execute(conn, "PREPARE COMMIT #{s}")
           else
             super
@@ -75,7 +75,16 @@ module Sequel
           when :set_column_null
             "ALTER TABLE #{quote_schema_table(table)} ALTER COLUMN #{quote_identifier(op[:name])} SET#{' NOT' unless op[:null]} NULL"
           when :set_column_type
-            "ALTER TABLE #{quote_schema_table(table)} ALTER COLUMN #{quote_identifier(op[:name])} #{type_literal(op)}"
+            if sch = schema(table)
+              if cs = sch.each{|k, v| break v if k == op[:name]; nil}
+                cs = cs.dup
+                cs[:default] = cs[:ruby_default]
+                op = cs.merge!(op)
+              end
+            end
+            sql = "ALTER TABLE #{quote_schema_table(table)} ALTER COLUMN #{quote_identifier(op[:name])} #{type_literal(op)}"
+            column_definition_order.each{|m| send(:"column_definition_#{m}_sql", sql, op)}
+            sql
           else
             super(table, op)
           end
@@ -100,6 +109,12 @@ module Sequel
         def primary_key_index_re
           PRIMARY_KEY_INDEX_RE
         end
+
+        # Use BIGINT IDENTITY for identity columns that use bigint, fixes
+        # the case where primary_key :column, :type=>Bignum is used.
+        def type_literal_generic_bignum(column)
+          column[:identity] ? 'BIGINT IDENTITY' : super
+        end
       end
       
       # Dataset class for H2 datasets accessed via JDBC.
@@ -110,7 +125,7 @@ module Sequel
         HSTAR = "H*".freeze
         BITCOMP_OPEN = "((0 - ".freeze
         BITCOMP_CLOSE = ") - 1)".freeze
-        ILIKE_PLACEHOLDER = "CAST(? AS VARCHAR_IGNORECASE)".freeze
+        ILIKE_PLACEHOLDER = ["CAST(".freeze, " AS VARCHAR_IGNORECASE)".freeze].freeze
         TIME_FORMAT = "'%H:%M:%S'".freeze
         
         # Emulate the case insensitive LIKE operator and the bitwise operators.
@@ -158,7 +173,7 @@ module Sequel
         #JAVA_H2_CLOB = Java::OrgH2Jdbc::JdbcClob
 
         class ::Sequel::JDBC::Dataset::TYPE_TRANSLATOR
-          def h2_clob(v) Sequel::SQL::Blob.new(v.getSubString(1, v.length)) end
+          def h2_clob(v) v.getSubString(1, v.length) end
         end
 
         H2_CLOB_METHOD = TYPE_TRANSLATOR_INSTANCE.method(:h2_clob)

@@ -16,8 +16,8 @@ module Sequel
               log_yield(sql){conn.do(sql)}
               begin
                 s = log_yield(LAST_INSERT_ID_SQL){conn.run(LAST_INSERT_ID_SQL)}
-                if (rows = s.fetch_all) and (row = rows.first)
-                  Integer(row.first)
+                if (rows = s.fetch_all) and (row = rows.first) and (v = row.first)
+                  Integer(v)
                 end
               ensure
                 s.drop if s
@@ -28,9 +28,22 @@ module Sequel
           end
         end
       end
-      
       class Dataset < ODBC::Dataset
         include Sequel::MSSQL::DatasetMethods
+
+        private
+
+        # Use ODBC format, not Microsoft format, as the ODBC layer does
+        # some translation.
+        def default_timestamp_format
+          TIMESTAMP_FORMAT
+        end
+
+        # Use ODBC format, not Microsoft format, as the ODBC layer does
+        # some translation.
+        def literal_date(v)
+          v.strftime(ODBC_DATE_FORMAT)
+        end
       end
     end
   end

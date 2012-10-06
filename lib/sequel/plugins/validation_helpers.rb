@@ -40,6 +40,37 @@ module Sequel
     # changing the values of the Sequel::Plugins::ValidationHelpers::DEFAULT_OPTIONS hash.  You
     # change change the default options on a per model basis
     # by overriding a private instance method default_validation_helpers_options.
+    #
+    # By changing the default options, you can setup internationalization of the
+    # error messages.  For example, you would modify the default options:
+    #
+    #   Sequel::Plugins::ValidationHelpers::DEFAULT_OPTIONS.merge!(
+    #     :exact_length=>{:message=>lambda{|exact| I18n.t("errors.exact_length", :exact => exact)}},
+    #     :integer=>{:message=>lambda{I18n.t("errors.integer")}},
+    #     ...
+    #   )
+    #
+    # and then use something like this in your yaml translation file:
+    #
+    #   en:
+    #     errors:
+    #       exact_length: "is not %{exact} characters"
+    #       integer: "is not a number"
+    #
+    # Note that if you want to support internationalization of Errors#full_messages,
+    # you need to override the method.  Here's an example:
+    #   
+    #   class Sequel::Model::Errors
+    #     ATTRIBUTE_JOINER = I18n.t('errors.joiner').freeze
+    #     def full_messages
+    #       inject([]) do |m, kv|
+    #         att, errors = *kv
+    #         att.is_a?(Array) ? Array(att).map!{|v| I18n.t("attributes.#{v}")} : att = I18n.t("attributes.#{att}")
+    #         errors.each {|e| m << (e.is_a?(LiteralString) ? e : "#{Array(att).join(ATTRIBUTE_JOINER)} #{e}")}
+    #         m
+    #       end
+    #     end
+    #   end
     module ValidationHelpers
       # Default validation options used by Sequel.  Can be modified to change the error
       # messages for all models (e.g. for internationalization), or to set certain
@@ -162,19 +193,39 @@ module Sequel
         # since it can deal with a grouping of multiple attributes.
         #
         # Possible Options:
-        # * :message - The message to use (default: 'is already taken')
-        # * :only_if_modified - Only check the uniqueness if the object is new or
-        #   one of the columns has been modified.
+        # :message :: The message to use (default: 'is already taken')
+        # :only_if_modified :: Only check the uniqueness if the object is new or
+        #                      one of the columns has been modified.
+        # :where :: A callable object where call takes three arguments, a dataset,
+        #           the current object, and an array of columns, and should return
+        #           a modified dataset that is filtered to include only rows with
+        #           the same values as the current object for each column in the array.
+        #
+        # If you want to to a case insensitive uniqueness validation on a database that
+        # is case sensitive by default, you can use:
+        #
+        #   :where=>(proc do |ds, obj, cols|
+        #     ds.where(cols.map do |c|
+        #       v = obj.send(c)
+        #       v = v.downcase if v
+        #       [Sequel.function(:lower, c), v]
+        #     end)
+        #   end)
         def validates_unique(*atts)
           opts = default_validation_helpers_options(:unique)
           if atts.last.is_a?(Hash)
             opts = opts.merge(atts.pop)
           end
           message = validation_error_message(opts[:message])
+          where = opts[:where]
           atts.each do |a|
             arr = Array(a)
             next if opts[:only_if_modified] && !new? && !arr.any?{|x| changed_columns.include?(x)}
-            ds = model.filter(arr.map{|x| [x, send(x)]})
+            ds = if where
+              where.call(model.dataset, self, arr)
+            else
+              model.where(arr.map{|x| [x, send(x)]})
+            end
             ds = yield(ds) if block_given?
             ds = ds.exclude(pk_hash) unless new?
             errors.add(a, message) unless ds.count == 0

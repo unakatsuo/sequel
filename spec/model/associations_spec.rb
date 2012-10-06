@@ -125,6 +125,18 @@ describe Sequel::Model, "associate" do
     end
   end
 
+  it "should raise an error if attempting to clone an association of differing type" do
+    c = Class.new(Sequel::Model(:c))
+    c.many_to_one :c
+    proc{c.one_to_many :cs, :clone=>:c}.should raise_error(Sequel::Error)
+  end
+
+  it "should allow cloning of one_to_many to one_to_one associations and vice-versa" do
+    c = Class.new(Sequel::Model(:c))
+    c.one_to_one :c
+    proc{c.one_to_many :cs, :clone=>:c}.should_not raise_error(Sequel::Error)
+    proc{c.one_to_one :c2, :clone=>:cs}.should_not raise_error(Sequel::Error)
+  end
 end
 
 describe Sequel::Model, "many_to_one" do
@@ -146,6 +158,21 @@ describe Sequel::Model, "many_to_one" do
     p.values.should == {:x => 1, :id => 1}
 
     MODEL_DB.sqls.should == ["SELECT * FROM nodes WHERE (nodes.id = 234) LIMIT 1"]
+  end
+  
+  it "should allow association with the same name as the key if :key_alias is given" do
+    @c2.def_column_alias(:parent_id_id, :parent_id)
+    @c2.many_to_one :parent_id, :key_column=>:parent_id, :class => @c2
+    d = @c2.load(:id => 1, :parent_id => 234)
+    d.parent_id_dataset.sql.should == "SELECT * FROM nodes WHERE (nodes.id = 234) LIMIT 1"
+    d.parent_id.should == @c2.load(:x => 1, :id => 1)
+    d.parent_id_id.should == 234
+    d[:parent_id].should == 234
+    MODEL_DB.sqls.should == ["SELECT * FROM nodes WHERE (nodes.id = 234) LIMIT 1"]
+
+    d.parent_id_id = 3
+    d.parent_id_id.should == 3
+    d[:parent_id].should == 3
   end
   
   it "should use implicit class if omitted" do
@@ -232,7 +259,7 @@ describe Sequel::Model, "many_to_one" do
 
   it "should support :order, :limit (only for offset), and :dataset options, as well as a block" do
     @c2.many_to_one :child_20, :class => @c2, :key=>:id, :dataset=>proc{model.filter(:parent_id=>pk)}, :limit=>[10,20], :order=>:name do |ds|
-      ds.filter(:x.sql_number > 1)
+      ds.filter{x > 1}
     end
     @c2.load(:id => 100).child_20
     MODEL_DB.sqls.should == ["SELECT * FROM nodes WHERE ((parent_id = 100) AND (x > 1)) ORDER BY name LIMIT 1 OFFSET 20"]
@@ -367,7 +394,7 @@ describe Sequel::Model, "many_to_one" do
     MODEL_DB.sqls.should == ["SELECT * FROM nodes WHERE ((nodes.id = 234) AND (name > 'M')) LIMIT 1"]
   end
   
-  it "should use a block given to the association method as a callback on ruby 1.8.7+" do
+  it "should use a block given to the association method as a callback" do
     @c2.many_to_one :parent, :class => @c2
 
     d = @c2.create(:id => 1)
@@ -376,7 +403,7 @@ describe Sequel::Model, "many_to_one" do
     d.associations[:parent] = 42
     d.parent{|ds| ds.filter{name > 'M'}}.should_not == 42 
     MODEL_DB.sqls.should == ["SELECT * FROM nodes WHERE ((nodes.id = 234) AND (name > 'M')) LIMIT 1"]
-  end if RUBY_VERSION >= '1.8.7'
+  end
   
   it "should have the setter add to the reciprocal one_to_many cached association list if it exists" do
     @c2.many_to_one :parent, :class => @c2
@@ -439,6 +466,20 @@ describe Sequel::Model, "many_to_one" do
     e.children.should_not(include(d))
     d.parent = nil
     f.children.should_not(include(d))
+    MODEL_DB.sqls.should == []
+  end
+
+  it "should have the setter not modify the reciprocal if set to same value as current" do
+    @c2.many_to_one :parent, :class => @c2
+    @c2.one_to_many :children, :class => @c2, :key=>:parent_id
+
+    c1 = @c2.load(:id => 1, :parent_id=>nil)
+    c2 = @c2.load(:id => 2, :parent_id=>1)
+    c3 = @c2.load(:id => 3, :parent_id=>1)
+    c1.associations[:children] = [c2, c3]
+    c2.associations[:parent] = c1
+    c2.parent = c1
+    c1.children.should == [c2, c3]
     MODEL_DB.sqls.should == []
   end
 
@@ -638,12 +679,12 @@ describe Sequel::Model, "one_to_one" do
   it "should add a setter method" do
     @c2.one_to_one :attribute, :class => @c1
     attrib = @c1.new(:id=>3)
-    @c1.dataset._fetch = {:id=>3}
+    @c1.dataset._fetch = @c1.instance_dataset._fetch = {:id=>3}
     @c2.new(:id => 1234).attribute = attrib
     sqls = MODEL_DB.sqls
     ['INSERT INTO attributes (node_id, id) VALUES (1234, 3)',
       'INSERT INTO attributes (id, node_id) VALUES (3, 1234)'].should(include(sqls.slice! 1))
-    sqls.should == ['UPDATE attributes SET node_id = NULL WHERE ((node_id = 1234) AND (id != 3))', "SELECT * FROM attributes WHERE (id = 3) LIMIT 1"]
+    sqls.should == ['UPDATE attributes SET node_id = NULL WHERE (node_id = 1234)', "SELECT * FROM attributes WHERE (id = 3) LIMIT 1"]
 
     @c2.new(:id => 1234).attribute.should == attrib
     attrib = @c1.load(:id=>3)
@@ -677,12 +718,12 @@ describe Sequel::Model, "one_to_one" do
   it "should have the setter method respect the :primary_key option" do
     @c2.one_to_one :attribute, :class => @c1, :primary_key=>:xxx
     attrib = @c1.new(:id=>3)
-    @c1.dataset._fetch = {:id=>3}
+    @c1.dataset._fetch = @c1.instance_dataset._fetch = {:id=>3}
     @c2.new(:id => 1234, :xxx=>5).attribute = attrib
     sqls = MODEL_DB.sqls
     ['INSERT INTO attributes (node_id, id) VALUES (5, 3)',
       'INSERT INTO attributes (id, node_id) VALUES (3, 5)'].should(include(sqls.slice! 1))
-    sqls.should == ['UPDATE attributes SET node_id = NULL WHERE ((node_id = 5) AND (id != 3))', "SELECT * FROM attributes WHERE (id = 3) LIMIT 1"]
+    sqls.should == ['UPDATE attributes SET node_id = NULL WHERE (node_id = 5)', "SELECT * FROM attributes WHERE (id = 3) LIMIT 1"]
 
     @c2.new(:id => 321, :xxx=>5).attribute.should == attrib
     attrib = @c1.load(:id=>3)
@@ -792,7 +833,7 @@ describe Sequel::Model, "one_to_one" do
 
   it "should support :order, :limit (only for offset), and :dataset options, as well as a block" do
     @c2.one_to_one :child_20, :class => @c2, :key=>:id, :dataset=>proc{model.filter(:parent_id=>pk)}, :limit=>[10,20], :order=>:name do |ds|
-      ds.filter(:x.sql_number > 1)
+      ds.filter{x > 1}
     end
     @c2.load(:id => 100).child_20
     MODEL_DB.sqls.should == ["SELECT * FROM nodes WHERE ((parent_id = 100) AND (x > 1)) ORDER BY name LIMIT 1 OFFSET 20"]
@@ -816,49 +857,17 @@ describe Sequel::Model, "one_to_one" do
     MODEL_DB.sqls.should == []
   end
 
-  it "should define a setter method" do
-    @c2.one_to_one :parent, :class => @c2
-
-    d = @c2.new(:id => 1)
-    f = @c2.new(:id => 3, :node_id=> 4321)
-    @c2.dataset._fetch = {:id => 3, :node_id=>1}
-    d.parent = f
-    f.values.should == {:id => 3, :node_id=>1}
-    d.parent.should == f
-    sqls = MODEL_DB.sqls
-    ["INSERT INTO nodes (node_id, id) VALUES (1, 3)",
-     "INSERT INTO nodes (id, node_id) VALUES (3, 1)"].should include(sqls.slice! 1)
-    sqls.should == ["UPDATE nodes SET node_id = NULL WHERE ((node_id = 1) AND (id != 3))", "SELECT * FROM nodes WHERE (id = 3) LIMIT 1"]
-    
-    d.parent = nil
-    d.parent.should == nil
-    MODEL_DB.sqls.should == ["UPDATE nodes SET node_id = NULL WHERE (node_id = 1)"]
-  end
-  
-  it "should have the setter method respect the :primary_key option" do
-    @c2.one_to_one :parent, :class => @c2, :primary_key=>:blah
-    d = @c2.new(:id => 1, :blah => 3)
-    e = @c2.new(:id => 4321, :node_id=>444)
-    @c2.dataset._fetch = {:id => 4321, :node_id => 3}
-    d.parent = e
-    e.values.should == {:id => 4321, :node_id => 3}
-    sqls = MODEL_DB.sqls
-    ["INSERT INTO nodes (node_id, id) VALUES (3, 4321)",
-     "INSERT INTO nodes (id, node_id) VALUES (4321, 3)"].should include(sqls.slice! 1)
-    sqls.should == ["UPDATE nodes SET node_id = NULL WHERE ((node_id = 3) AND (id != 4321))", "SELECT * FROM nodes WHERE (id = 4321) LIMIT 1"]
-  end
-  
   it "should have the setter method respect the :key option" do
     @c2.one_to_one :parent, :class => @c2, :key=>:blah
     d = @c2.new(:id => 3)
     e = @c2.new(:id => 4321, :blah=>444)
-    @c2.dataset._fetch = {:id => 4321, :blah => 3}
+    @c2.dataset._fetch = @c2.instance_dataset._fetch = {:id => 4321, :blah => 3}
     d.parent = e
     e.values.should == {:id => 4321, :blah => 3}
     sqls = MODEL_DB.sqls
     ["INSERT INTO nodes (blah, id) VALUES (3, 4321)",
      "INSERT INTO nodes (id, blah) VALUES (4321, 3)"].should include(sqls.slice! 1)
-    sqls.should == ["UPDATE nodes SET blah = NULL WHERE ((blah = 3) AND (id != 4321))", "SELECT * FROM nodes WHERE (id = 4321) LIMIT 1"]
+    sqls.should == ["UPDATE nodes SET blah = NULL WHERE (blah = 3)", "SELECT * FROM nodes WHERE (id = 4321) LIMIT 1"]
   end
   
   it "should persist changes to associated object when the setter is called" do
@@ -942,6 +951,19 @@ describe Sequel::Model, "one_to_one" do
     e.child.should == nil
     d.parent = nil
     f.child.should == nil
+  end
+
+  it "should have the setter not modify the reciprocal if set to same value as current" do
+    @c2.one_to_one :parent, :class => @c2, :key=>:parent_id
+    @c2.many_to_one :child, :class => @c2, :key=>:parent_id
+
+    c1 = @c2.load(:id => 1, :parent_id=>nil)
+    c2 = @c2.load(:id => 2, :parent_id=>1)
+    c1.associations[:child] = c2
+    c2.associations[:parent] = c1
+    c2.parent = c1
+    c1.child.should == c2
+    MODEL_DB.sqls.should == []
   end
 
   it "should not add associations methods directly to class" do
@@ -1166,7 +1188,7 @@ describe Sequel::Model, "one_to_many" do
     
     n = @c2.load(:id => 1234)
     a = @c1.new(:id => 234)
-    @c1.dataset._fetch = {:node_id => 1234, :id => 234}
+    @c1.dataset._fetch = @c1.instance_dataset._fetch = {:node_id => 1234, :id => 234}
     a.should == n.add_attribute(a)
     sqls = MODEL_DB.sqls
     sqls.shift.should =~ /INSERT INTO attributes \((node_)?id, (node_)?id\) VALUES \(1?234, 1?234\)/
@@ -1181,7 +1203,7 @@ describe Sequel::Model, "one_to_many" do
     a = @c1.load(:id => 2345, :node_id => 1234)
     a.should == n.remove_attribute(a)
     a.values.should == {:node_id => nil, :id => 2345}
-    MODEL_DB.sqls.should == ["SELECT 1 FROM attributes WHERE ((attributes.node_id = 1234) AND (id = 2345)) LIMIT 1", 'UPDATE attributes SET node_id = NULL WHERE (id = 2345)']
+    MODEL_DB.sqls.should == ["SELECT 1 AS one FROM attributes WHERE ((attributes.node_id = 1234) AND (id = 2345)) LIMIT 1", 'UPDATE attributes SET node_id = NULL WHERE (id = 2345)']
   end
 
   it "should have the remove_ method raise an error if the passed object is not already associated" do
@@ -1191,14 +1213,14 @@ describe Sequel::Model, "one_to_many" do
     a = @c1.load(:id => 2345, :node_id => 1234)
     @c1.dataset._fetch = []
     proc{n.remove_attribute(a)}.should raise_error(Sequel::Error)
-    MODEL_DB.sqls.should == ["SELECT 1 FROM attributes WHERE ((attributes.node_id = 1234) AND (id = 2345)) LIMIT 1"]
+    MODEL_DB.sqls.should == ["SELECT 1 AS one FROM attributes WHERE ((attributes.node_id = 1234) AND (id = 2345)) LIMIT 1"]
   end
 
   it "should accept a hash for the add_ method and create a new record" do
     @c2.one_to_many :attributes, :class => @c1
     n = @c2.new(:id => 1234)
     MODEL_DB.reset
-    @c1.dataset._fetch = {:node_id => 1234, :id => 234}
+    @c1.dataset._fetch = @c1.instance_dataset._fetch = {:node_id => 1234, :id => 234}
     n.add_attribute(:id => 234).should == @c1.load(:node_id => 1234, :id => 234)
     sqls = MODEL_DB.sqls
     sqls.shift.should =~ /INSERT INTO attributes \((node_)?id, (node_)?id\) VALUES \(1?234, 1?234\)/
@@ -1287,7 +1309,7 @@ describe Sequel::Model, "one_to_many" do
     n.remove_attribute(a).should == a
     sqls = MODEL_DB.sqls
     sqls.pop.should =~ /UPDATE attributes SET (node_id|y) = NULL, (node_id|y) = NULL WHERE \(id = 2345\)/
-    sqls.should == ["SELECT 1 FROM attributes WHERE ((attributes.node_id = 1234) AND (attributes.y = 5) AND (id = 2345)) LIMIT 1"]
+    sqls.should == ["SELECT 1 AS one FROM attributes WHERE ((attributes.node_id = 1234) AND (attributes.y = 5) AND (id = 2345)) LIMIT 1"]
   end
   
   it "should accept a array of composite primary key values for the remove_ method and remove an existing record" do
@@ -1343,7 +1365,7 @@ describe Sequel::Model, "one_to_many" do
   it "should support a conditions option" do
     @c2.one_to_many :attributes, :class => @c1, :conditions => {:a=>32}
     @c2.new(:id => 1234).attributes_dataset.sql.should == "SELECT * FROM attributes WHERE ((attributes.node_id = 1234) AND (a = 32))"
-    @c2.one_to_many :attributes, :class => @c1, :conditions => ~:a
+    @c2.one_to_many :attributes, :class => @c1, :conditions => Sequel.~(:a)
     @c2.new(:id => 1234).attributes_dataset.sql.should == "SELECT * FROM attributes WHERE ((attributes.node_id = 1234) AND NOT a)"
   end
   
@@ -1754,7 +1776,7 @@ describe Sequel::Model, "many_to_many" do
       attr_accessor :yyy
       def self.name; 'Attribute'; end
       def self.to_s; 'Attribute'; end
-      columns :id, :y
+      columns :id, :y, :z
     end
 
     @c2 = Class.new(Sequel::Model(:nodes)) do
@@ -1797,6 +1819,11 @@ describe Sequel::Model, "many_to_many" do
     ensure
       Object.send(:remove_const, :Historical)
     end
+  end
+  
+  it "should respect :eager_loader_predicate_key when lazily loading" do
+    @c2.many_to_many :attributes, :class => @c1, :eager_loading_predicate_key=>Sequel.subscript(:attributes_nodes__node_id, 0)
+    @c2.new(:id => 1234).attributes_dataset.sql.should == 'SELECT attributes.* FROM attributes INNER JOIN attributes_nodes ON ((attributes_nodes.attribute_id = attributes.id) AND (attributes_nodes.node_id[0] = 1234))'
   end
   
   it "should use explicit key values and join table if given" do
@@ -1859,7 +1886,7 @@ describe Sequel::Model, "many_to_many" do
   end
   
   it "should support an array for the select option" do
-    @c2.many_to_many :attributes, :class => @c1, :select => [:attributes.*, :attribute_nodes__blah2]
+    @c2.many_to_many :attributes, :class => @c1, :select => [Sequel::SQL::ColumnAll.new(:attributes), :attribute_nodes__blah2]
 
     @c2.new(:id => 1234).attributes_dataset.sql.should == 'SELECT attributes.*, attribute_nodes.blah2 FROM attributes INNER JOIN attributes_nodes ON ((attributes_nodes.attribute_id = attributes.id) AND (attributes_nodes.node_id = 1234))'
   end
@@ -1954,7 +1981,7 @@ describe Sequel::Model, "many_to_many" do
     @c2.many_to_many :attributes, :class => @c1
     
     n = @c2.load(:id => 1234)
-    @c1.dataset._fetch = {:id=>1}
+    @c1.dataset._fetch = @c1.instance_dataset._fetch = {:id=>1}
     n.add_attribute(:id => 1).should == @c1.load(:id => 1)
     sqls = MODEL_DB.sqls
     ['INSERT INTO attributes_nodes (node_id, attribute_id) VALUES (1234, 1)',
@@ -2016,9 +2043,9 @@ describe Sequel::Model, "many_to_many" do
   end
   
   it "should have the add_ method respect composite keys" do
-    @c2.many_to_many :attributes, :class => @c1, :left_key=>[:l1, :l2], :right_key=>[:r1, :r2], :left_primary_key=>[:id, :x], :right_primary_key=>[:id, :y]
+    @c2.many_to_many :attributes, :class => @c1, :left_key=>[:l1, :l2], :right_key=>[:r1, :r2], :left_primary_key=>[:id, :x], :right_primary_key=>[:id, :z]
     n = @c2.load(:id => 1234, :x=>5)
-    a = @c1.load(:id => 2345, :y=>8)
+    a = @c1.load(:id => 2345, :z=>8)
     a.should == n.add_attribute(a)
     sqls = MODEL_DB.sqls
     m = /INSERT INTO attributes_nodes \((\w+), (\w+), (\w+), (\w+)\) VALUES \((\d+), (\d+), (\d+), (\d+)\)/.match(sqls.pop)
@@ -2038,14 +2065,14 @@ describe Sequel::Model, "many_to_many" do
   end
   
   it "should have the add_ method respect composite keys" do
-    @c2.many_to_many :attributes, :class => @c1, :left_key=>[:l1, :l2], :right_key=>[:r1, :r2], :left_primary_key=>[:id, :x], :right_primary_key=>[:id, :y]
-    @c1.set_primary_key [:id, :y]
+    @c2.many_to_many :attributes, :class => @c1, :left_key=>[:l1, :l2], :right_key=>[:r1, :r2], :left_primary_key=>[:id, :x], :right_primary_key=>[:id, :z]
+    @c1.set_primary_key [:id, :z]
     n = @c2.load(:id => 1234, :x=>5)
-    a = @c1.load(:id => 2345, :y=>8)
-    @c1.dataset._fetch = {:id => 2345, :y=>8}
+    a = @c1.load(:id => 2345, :z=>8)
+    @c1.dataset._fetch = {:id => 2345, :z=>8}
     n.add_attribute([2345, 8]).should == a
     sqls = MODEL_DB.sqls
-    sqls.shift.should =~ /SELECT \* FROM attributes WHERE \(\((id|y) = (8|2345)\) AND \((id|y) = (8|2345)\)\) LIMIT 1/
+    sqls.shift.should =~ /SELECT \* FROM attributes WHERE \(\((id|z) = (8|2345)\) AND \((id|z) = (8|2345)\)\) LIMIT 1/
     sqls.pop.should =~ /INSERT INTO attributes_nodes \([lr][12], [lr][12], [lr][12], [lr][12]\) VALUES \((1234|5|2345|8), (1234|5|2345|8), (1234|5|2345|8), (1234|5|2345|8)\)/
     sqls.should == []
   end
@@ -2060,9 +2087,9 @@ describe Sequel::Model, "many_to_many" do
   end
   
   it "should have the remove_ method respect composite keys" do
-    @c2.many_to_many :attributes, :class => @c1, :left_key=>[:l1, :l2], :right_key=>[:r1, :r2], :left_primary_key=>[:id, :x], :right_primary_key=>[:id, :y]
+    @c2.many_to_many :attributes, :class => @c1, :left_key=>[:l1, :l2], :right_key=>[:r1, :r2], :left_primary_key=>[:id, :x], :right_primary_key=>[:id, :z]
     n = @c2.load(:id => 1234, :x=>5)
-    a = @c1.load(:id => 2345, :y=>8)
+    a = @c1.load(:id => 2345, :z=>8)
     a.should == n.remove_attribute(a)
     MODEL_DB.sqls.should == ["DELETE FROM attributes_nodes WHERE ((l1 = 1234) AND (l2 = 5) AND (r1 = 2345) AND (r2 = 8))"]
   end
@@ -2513,42 +2540,42 @@ describe "Filtering by associations" do
   end
 
   it "should be able to filter on many_to_one associations" do
-    @Album.filter(:artist=>@Artist.load(:id=>3)).sql.should == 'SELECT * FROM albums WHERE (artist_id = 3)'
+    @Album.filter(:artist=>@Artist.load(:id=>3)).sql.should == 'SELECT * FROM albums WHERE (albums.artist_id = 3)'
   end
 
   it "should be able to filter on one_to_many associations" do
-    @Album.filter(:tracks=>@Track.load(:album_id=>3)).sql.should == 'SELECT * FROM albums WHERE (id = 3)'
+    @Album.filter(:tracks=>@Track.load(:album_id=>3)).sql.should == 'SELECT * FROM albums WHERE (albums.id = 3)'
   end
 
   it "should be able to filter on one_to_one associations" do
-    @Album.filter(:album_info=>@AlbumInfo.load(:album_id=>3)).sql.should == 'SELECT * FROM albums WHERE (id = 3)'
+    @Album.filter(:album_info=>@AlbumInfo.load(:album_id=>3)).sql.should == 'SELECT * FROM albums WHERE (albums.id = 3)'
   end
 
   it "should be able to filter on many_to_many associations" do
-    @Album.filter(:tags=>@Tag.load(:id=>3)).sql.should == 'SELECT * FROM albums WHERE (id IN (SELECT album_id FROM albums_tags WHERE ((tag_id = 3) AND (album_id IS NOT NULL))))'
+    @Album.filter(:tags=>@Tag.load(:id=>3)).sql.should == 'SELECT * FROM albums WHERE (albums.id IN (SELECT albums_tags.album_id FROM albums_tags WHERE ((albums_tags.tag_id = 3) AND (albums_tags.album_id IS NOT NULL))))'
   end
 
   it "should be able to filter on many_to_one associations with composite keys" do
-    @Album.filter(:cartist=>@Artist.load(:id1=>3, :id2=>4)).sql.should == 'SELECT * FROM albums WHERE ((artist_id1 = 3) AND (artist_id2 = 4))'
+    @Album.filter(:cartist=>@Artist.load(:id1=>3, :id2=>4)).sql.should == 'SELECT * FROM albums WHERE ((albums.artist_id1 = 3) AND (albums.artist_id2 = 4))'
   end
 
   it "should be able to filter on one_to_many associations with composite keys" do
-    @Album.filter(:ctracks=>@Track.load(:album_id1=>3, :album_id2=>4)).sql.should == 'SELECT * FROM albums WHERE ((id1 = 3) AND (id2 = 4))'
+    @Album.filter(:ctracks=>@Track.load(:album_id1=>3, :album_id2=>4)).sql.should == 'SELECT * FROM albums WHERE ((albums.id1 = 3) AND (albums.id2 = 4))'
   end
 
   it "should be able to filter on one_to_one associations with composite keys" do
-    @Album.filter(:calbum_info=>@AlbumInfo.load(:album_id1=>3, :album_id2=>4)).sql.should == 'SELECT * FROM albums WHERE ((id1 = 3) AND (id2 = 4))' 
+    @Album.filter(:calbum_info=>@AlbumInfo.load(:album_id1=>3, :album_id2=>4)).sql.should == 'SELECT * FROM albums WHERE ((albums.id1 = 3) AND (albums.id2 = 4))' 
   end
 
   it "should be able to filter on many_to_many associations with composite keys" do
-    @Album.filter(:ctags=>@Tag.load(:tid1=>3, :tid2=>4)).sql.should == 'SELECT * FROM albums WHERE ((id1, id2) IN (SELECT album_id1, album_id2 FROM albums_tags WHERE ((tag_id1 = 3) AND (tag_id2 = 4) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL))))'
+    @Album.filter(:ctags=>@Tag.load(:tid1=>3, :tid2=>4)).sql.should == 'SELECT * FROM albums WHERE ((albums.id1, albums.id2) IN (SELECT albums_tags.album_id1, albums_tags.album_id2 FROM albums_tags WHERE ((albums_tags.tag_id1 = 3) AND (albums_tags.tag_id2 = 4) AND (albums_tags.album_id1 IS NOT NULL) AND (albums_tags.album_id2 IS NOT NULL))))'
   end
 
   it "should work inside a complex filter" do
     artist = @Artist.load(:id=>3)
-    @Album.filter{foo & {:artist=>artist}}.sql.should == 'SELECT * FROM albums WHERE (foo AND (artist_id = 3))'
+    @Album.filter{foo & {:artist=>artist}}.sql.should == 'SELECT * FROM albums WHERE (foo AND (albums.artist_id = 3))'
     track = @Track.load(:album_id=>4)
-    @Album.filter{foo & [[:artist, artist], [:tracks, track]]}.sql.should == 'SELECT * FROM albums WHERE (foo AND (artist_id = 3) AND (id = 4))'
+    @Album.filter{foo & [[:artist, artist], [:tracks, track]]}.sql.should == 'SELECT * FROM albums WHERE (foo AND (albums.artist_id = 3) AND (albums.id = 4))'
   end
 
   it "should raise for an invalid association name" do
@@ -2575,109 +2602,109 @@ describe "Filtering by associations" do
 
   it "should not affect non-association IN/NOT IN filtering with an empty array" do
     @Album.filter(:tag_id=>[]).sql.should == 'SELECT * FROM albums WHERE (tag_id != tag_id)'
-    @Album.exclude(:tag_id=>[]).sql.should == 'SELECT * FROM albums WHERE (1 = 1)'
+    @Album.exclude(:tag_id=>[]).sql.should == 'SELECT * FROM albums WHERE (tag_id = tag_id)'
   end
 
   it "should work correctly in subclasses" do
     c = Class.new(@Album)
     c.many_to_one :sartist, :class=>@Artist
-    c.filter(:sartist=>@Artist.load(:id=>3)).sql.should == 'SELECT * FROM albums WHERE (sartist_id = 3)'
+    c.filter(:sartist=>@Artist.load(:id=>3)).sql.should == 'SELECT * FROM albums WHERE (albums.sartist_id = 3)'
   end
 
   it "should be able to exclude on many_to_one associations" do
-    @Album.exclude(:artist=>@Artist.load(:id=>3)).sql.should == 'SELECT * FROM albums WHERE ((artist_id != 3) OR (artist_id IS NULL))'
+    @Album.exclude(:artist=>@Artist.load(:id=>3)).sql.should == 'SELECT * FROM albums WHERE ((albums.artist_id != 3) OR (albums.artist_id IS NULL))'
   end
 
   it "should be able to exclude on one_to_many associations" do
-    @Album.exclude(:tracks=>@Track.load(:album_id=>3)).sql.should == 'SELECT * FROM albums WHERE ((id != 3) OR (id IS NULL))'
+    @Album.exclude(:tracks=>@Track.load(:album_id=>3)).sql.should == 'SELECT * FROM albums WHERE ((albums.id != 3) OR (albums.id IS NULL))'
   end
 
   it "should be able to exclude on one_to_one associations" do
-    @Album.exclude(:album_info=>@AlbumInfo.load(:album_id=>3)).sql.should == 'SELECT * FROM albums WHERE ((id != 3) OR (id IS NULL))'
+    @Album.exclude(:album_info=>@AlbumInfo.load(:album_id=>3)).sql.should == 'SELECT * FROM albums WHERE ((albums.id != 3) OR (albums.id IS NULL))'
   end
 
   it "should be able to exclude on many_to_many associations" do
-    @Album.exclude(:tags=>@Tag.load(:id=>3)).sql.should == 'SELECT * FROM albums WHERE ((id NOT IN (SELECT album_id FROM albums_tags WHERE ((tag_id = 3) AND (album_id IS NOT NULL)))) OR (id IS NULL))'
+    @Album.exclude(:tags=>@Tag.load(:id=>3)).sql.should == 'SELECT * FROM albums WHERE ((albums.id NOT IN (SELECT albums_tags.album_id FROM albums_tags WHERE ((albums_tags.tag_id = 3) AND (albums_tags.album_id IS NOT NULL)))) OR (albums.id IS NULL))'
   end
 
   it "should be able to exclude on many_to_one associations with composite keys" do
-    @Album.exclude(:cartist=>@Artist.load(:id1=>3, :id2=>4)).sql.should == 'SELECT * FROM albums WHERE ((artist_id1 != 3) OR (artist_id2 != 4) OR (artist_id1 IS NULL) OR (artist_id2 IS NULL))'
+    @Album.exclude(:cartist=>@Artist.load(:id1=>3, :id2=>4)).sql.should == 'SELECT * FROM albums WHERE ((albums.artist_id1 != 3) OR (albums.artist_id2 != 4) OR (albums.artist_id1 IS NULL) OR (albums.artist_id2 IS NULL))'
   end
 
   it "should be able to exclude on one_to_many associations with composite keys" do
-    @Album.exclude(:ctracks=>@Track.load(:album_id1=>3, :album_id2=>4)).sql.should == 'SELECT * FROM albums WHERE ((id1 != 3) OR (id2 != 4) OR (id1 IS NULL) OR (id2 IS NULL))'
+    @Album.exclude(:ctracks=>@Track.load(:album_id1=>3, :album_id2=>4)).sql.should == 'SELECT * FROM albums WHERE ((albums.id1 != 3) OR (albums.id2 != 4) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))'
   end
 
   it "should be able to exclude on one_to_one associations with composite keys" do
-    @Album.exclude(:calbum_info=>@AlbumInfo.load(:album_id1=>3, :album_id2=>4)).sql.should == 'SELECT * FROM albums WHERE ((id1 != 3) OR (id2 != 4) OR (id1 IS NULL) OR (id2 IS NULL))' 
+    @Album.exclude(:calbum_info=>@AlbumInfo.load(:album_id1=>3, :album_id2=>4)).sql.should == 'SELECT * FROM albums WHERE ((albums.id1 != 3) OR (albums.id2 != 4) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))' 
   end
 
   it "should be able to exclude on many_to_many associations with composite keys" do
-    @Album.exclude(:ctags=>@Tag.load(:tid1=>3, :tid2=>4)).sql.should == 'SELECT * FROM albums WHERE (((id1, id2) NOT IN (SELECT album_id1, album_id2 FROM albums_tags WHERE ((tag_id1 = 3) AND (tag_id2 = 4) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL)))) OR (id1 IS NULL) OR (id2 IS NULL))'
+    @Album.exclude(:ctags=>@Tag.load(:tid1=>3, :tid2=>4)).sql.should == 'SELECT * FROM albums WHERE (((albums.id1, albums.id2) NOT IN (SELECT albums_tags.album_id1, albums_tags.album_id2 FROM albums_tags WHERE ((albums_tags.tag_id1 = 3) AND (albums_tags.tag_id2 = 4) AND (albums_tags.album_id1 IS NOT NULL) AND (albums_tags.album_id2 IS NOT NULL)))) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))'
   end
 
   it "should be able to filter on multiple many_to_one associations" do
-    @Album.filter(:artist=>[@Artist.load(:id=>3), @Artist.load(:id=>4)]).sql.should == 'SELECT * FROM albums WHERE (artist_id IN (3, 4))'
+    @Album.filter(:artist=>[@Artist.load(:id=>3), @Artist.load(:id=>4)]).sql.should == 'SELECT * FROM albums WHERE (albums.artist_id IN (3, 4))'
   end
 
   it "should be able to filter on multiple one_to_many associations" do
-    @Album.filter(:tracks=>[@Track.load(:album_id=>3), @Track.load(:album_id=>4)]).sql.should == 'SELECT * FROM albums WHERE (id IN (3, 4))'
+    @Album.filter(:tracks=>[@Track.load(:album_id=>3), @Track.load(:album_id=>4)]).sql.should == 'SELECT * FROM albums WHERE (albums.id IN (3, 4))'
   end
 
   it "should be able to filter on multiple one_to_one associations" do
-    @Album.filter(:album_info=>[@AlbumInfo.load(:album_id=>3), @AlbumInfo.load(:album_id=>4)]).sql.should == 'SELECT * FROM albums WHERE (id IN (3, 4))'
+    @Album.filter(:album_info=>[@AlbumInfo.load(:album_id=>3), @AlbumInfo.load(:album_id=>4)]).sql.should == 'SELECT * FROM albums WHERE (albums.id IN (3, 4))'
   end
 
   it "should be able to filter on multiple many_to_many associations" do
-    @Album.filter(:tags=>[@Tag.load(:id=>3), @Tag.load(:id=>4)]).sql.should == 'SELECT * FROM albums WHERE (id IN (SELECT album_id FROM albums_tags WHERE ((tag_id IN (3, 4)) AND (album_id IS NOT NULL))))'
+    @Album.filter(:tags=>[@Tag.load(:id=>3), @Tag.load(:id=>4)]).sql.should == 'SELECT * FROM albums WHERE (albums.id IN (SELECT albums_tags.album_id FROM albums_tags WHERE ((albums_tags.tag_id IN (3, 4)) AND (albums_tags.album_id IS NOT NULL))))'
   end
 
   it "should be able to filter on multiple many_to_one associations with composite keys" do
-    @Album.filter(:cartist=>[@Artist.load(:id1=>3, :id2=>4), @Artist.load(:id1=>5, :id2=>6)]).sql.should == 'SELECT * FROM albums WHERE ((artist_id1, artist_id2) IN ((3, 4), (5, 6)))'
+    @Album.filter(:cartist=>[@Artist.load(:id1=>3, :id2=>4), @Artist.load(:id1=>5, :id2=>6)]).sql.should == 'SELECT * FROM albums WHERE ((albums.artist_id1, albums.artist_id2) IN ((3, 4), (5, 6)))'
   end
 
   it "should be able to filter on multiple one_to_many associations with composite keys" do
-    @Album.filter(:ctracks=>[@Track.load(:album_id1=>3, :album_id2=>4), @Track.load(:album_id1=>5, :album_id2=>6)]).sql.should == 'SELECT * FROM albums WHERE ((id1, id2) IN ((3, 4), (5, 6)))'
+    @Album.filter(:ctracks=>[@Track.load(:album_id1=>3, :album_id2=>4), @Track.load(:album_id1=>5, :album_id2=>6)]).sql.should == 'SELECT * FROM albums WHERE ((albums.id1, albums.id2) IN ((3, 4), (5, 6)))'
   end
 
   it "should be able to filter on multiple one_to_one associations with composite keys" do
-    @Album.filter(:calbum_info=>[@AlbumInfo.load(:album_id1=>3, :album_id2=>4), @AlbumInfo.load(:album_id1=>5, :album_id2=>6)]).sql.should == 'SELECT * FROM albums WHERE ((id1, id2) IN ((3, 4), (5, 6)))' 
+    @Album.filter(:calbum_info=>[@AlbumInfo.load(:album_id1=>3, :album_id2=>4), @AlbumInfo.load(:album_id1=>5, :album_id2=>6)]).sql.should == 'SELECT * FROM albums WHERE ((albums.id1, albums.id2) IN ((3, 4), (5, 6)))' 
   end
 
   it "should be able to filter on multiple many_to_many associations with composite keys" do
-    @Album.filter(:ctags=>[@Tag.load(:tid1=>3, :tid2=>4), @Tag.load(:tid1=>5, :tid2=>6)]).sql.should == 'SELECT * FROM albums WHERE ((id1, id2) IN (SELECT album_id1, album_id2 FROM albums_tags WHERE (((tag_id1, tag_id2) IN ((3, 4), (5, 6))) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL))))'
+    @Album.filter(:ctags=>[@Tag.load(:tid1=>3, :tid2=>4), @Tag.load(:tid1=>5, :tid2=>6)]).sql.should == 'SELECT * FROM albums WHERE ((albums.id1, albums.id2) IN (SELECT albums_tags.album_id1, albums_tags.album_id2 FROM albums_tags WHERE (((albums_tags.tag_id1, albums_tags.tag_id2) IN ((3, 4), (5, 6))) AND (albums_tags.album_id1 IS NOT NULL) AND (albums_tags.album_id2 IS NOT NULL))))'
   end
 
   it "should be able to exclude on multiple many_to_one associations" do
-    @Album.exclude(:artist=>[@Artist.load(:id=>3), @Artist.load(:id=>4)]).sql.should == 'SELECT * FROM albums WHERE ((artist_id NOT IN (3, 4)) OR (artist_id IS NULL))'
+    @Album.exclude(:artist=>[@Artist.load(:id=>3), @Artist.load(:id=>4)]).sql.should == 'SELECT * FROM albums WHERE ((albums.artist_id NOT IN (3, 4)) OR (albums.artist_id IS NULL))'
   end
 
   it "should be able to exclude on multiple one_to_many associations" do
-    @Album.exclude(:tracks=>[@Track.load(:album_id=>3), @Track.load(:album_id=>4)]).sql.should == 'SELECT * FROM albums WHERE ((id NOT IN (3, 4)) OR (id IS NULL))'
+    @Album.exclude(:tracks=>[@Track.load(:album_id=>3), @Track.load(:album_id=>4)]).sql.should == 'SELECT * FROM albums WHERE ((albums.id NOT IN (3, 4)) OR (albums.id IS NULL))'
   end
 
   it "should be able to exclude on multiple one_to_one associations" do
-    @Album.exclude(:album_info=>[@AlbumInfo.load(:album_id=>3), @AlbumInfo.load(:album_id=>4)]).sql.should == 'SELECT * FROM albums WHERE ((id NOT IN (3, 4)) OR (id IS NULL))'
+    @Album.exclude(:album_info=>[@AlbumInfo.load(:album_id=>3), @AlbumInfo.load(:album_id=>4)]).sql.should == 'SELECT * FROM albums WHERE ((albums.id NOT IN (3, 4)) OR (albums.id IS NULL))'
   end
 
   it "should be able to exclude on multiple many_to_many associations" do
-    @Album.exclude(:tags=>[@Tag.load(:id=>3), @Tag.load(:id=>4)]).sql.should == 'SELECT * FROM albums WHERE ((id NOT IN (SELECT album_id FROM albums_tags WHERE ((tag_id IN (3, 4)) AND (album_id IS NOT NULL)))) OR (id IS NULL))'
+    @Album.exclude(:tags=>[@Tag.load(:id=>3), @Tag.load(:id=>4)]).sql.should == 'SELECT * FROM albums WHERE ((albums.id NOT IN (SELECT albums_tags.album_id FROM albums_tags WHERE ((albums_tags.tag_id IN (3, 4)) AND (albums_tags.album_id IS NOT NULL)))) OR (albums.id IS NULL))'
   end
 
   it "should be able to exclude on multiple many_to_one associations with composite keys" do
-    @Album.exclude(:cartist=>[@Artist.load(:id1=>3, :id2=>4), @Artist.load(:id1=>5, :id2=>6)]).sql.should == 'SELECT * FROM albums WHERE (((artist_id1, artist_id2) NOT IN ((3, 4), (5, 6))) OR (artist_id1 IS NULL) OR (artist_id2 IS NULL))'
+    @Album.exclude(:cartist=>[@Artist.load(:id1=>3, :id2=>4), @Artist.load(:id1=>5, :id2=>6)]).sql.should == 'SELECT * FROM albums WHERE (((albums.artist_id1, albums.artist_id2) NOT IN ((3, 4), (5, 6))) OR (albums.artist_id1 IS NULL) OR (albums.artist_id2 IS NULL))'
   end
 
   it "should be able to exclude on multiple one_to_many associations with composite keys" do
-    @Album.exclude(:ctracks=>[@Track.load(:album_id1=>3, :album_id2=>4), @Track.load(:album_id1=>5, :album_id2=>6)]).sql.should == 'SELECT * FROM albums WHERE (((id1, id2) NOT IN ((3, 4), (5, 6))) OR (id1 IS NULL) OR (id2 IS NULL))'
+    @Album.exclude(:ctracks=>[@Track.load(:album_id1=>3, :album_id2=>4), @Track.load(:album_id1=>5, :album_id2=>6)]).sql.should == 'SELECT * FROM albums WHERE (((albums.id1, albums.id2) NOT IN ((3, 4), (5, 6))) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))'
   end
 
   it "should be able to exclude on multiple one_to_one associations with composite keys" do
-    @Album.exclude(:calbum_info=>[@AlbumInfo.load(:album_id1=>3, :album_id2=>4), @AlbumInfo.load(:album_id1=>5, :album_id2=>6)]).sql.should == 'SELECT * FROM albums WHERE (((id1, id2) NOT IN ((3, 4), (5, 6))) OR (id1 IS NULL) OR (id2 IS NULL))' 
+    @Album.exclude(:calbum_info=>[@AlbumInfo.load(:album_id1=>3, :album_id2=>4), @AlbumInfo.load(:album_id1=>5, :album_id2=>6)]).sql.should == 'SELECT * FROM albums WHERE (((albums.id1, albums.id2) NOT IN ((3, 4), (5, 6))) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))' 
   end
 
   it "should be able to exclude on multiple many_to_many associations with composite keys" do
-    @Album.exclude(:ctags=>[@Tag.load(:tid1=>3, :tid2=>4), @Tag.load(:tid1=>5, :tid2=>6)]).sql.should == 'SELECT * FROM albums WHERE (((id1, id2) NOT IN (SELECT album_id1, album_id2 FROM albums_tags WHERE (((tag_id1, tag_id2) IN ((3, 4), (5, 6))) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL)))) OR (id1 IS NULL) OR (id2 IS NULL))'
+    @Album.exclude(:ctags=>[@Tag.load(:tid1=>3, :tid2=>4), @Tag.load(:tid1=>5, :tid2=>6)]).sql.should == 'SELECT * FROM albums WHERE (((albums.id1, albums.id2) NOT IN (SELECT albums_tags.album_id1, albums_tags.album_id2 FROM albums_tags WHERE (((albums_tags.tag_id1, albums_tags.tag_id2) IN ((3, 4), (5, 6))) AND (albums_tags.album_id1 IS NOT NULL) AND (albums_tags.album_id2 IS NOT NULL)))) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))'
   end
 
   it "should be able to handle NULL values when filtering many_to_one associations" do
@@ -2696,25 +2723,25 @@ describe "Filtering by associations" do
     @Album.filter(:tags=>@Tag.new).sql.should == 'SELECT * FROM albums WHERE \'f\''
   end
 
-  it "should be able to handle filteringing with NULL values for many_to_one associations with composite keys" do
+  it "should be able to handle filtering with NULL values for many_to_one associations with composite keys" do
     @Album.filter(:cartist=>@Artist.load(:id2=>4)).sql.should == 'SELECT * FROM albums WHERE \'f\''
     @Album.filter(:cartist=>@Artist.load(:id1=>3)).sql.should == 'SELECT * FROM albums WHERE \'f\''
     @Album.filter(:cartist=>@Artist.new).sql.should == 'SELECT * FROM albums WHERE \'f\''
   end
 
-  it "should be able to filtering with NULL values for one_to_many associations with composite keys" do
+  it "should be able to filter with NULL values for one_to_many associations with composite keys" do
     @Album.filter(:ctracks=>@Track.load(:album_id2=>4)).sql.should == 'SELECT * FROM albums WHERE \'f\''
     @Album.filter(:ctracks=>@Track.load(:album_id1=>3)).sql.should == 'SELECT * FROM albums WHERE \'f\''
     @Album.filter(:ctracks=>@Track.new).sql.should == 'SELECT * FROM albums WHERE \'f\''
   end
 
-  it "should be able to filtering with NULL values for one_to_one associations with composite keys" do
+  it "should be able to filter with NULL values for one_to_one associations with composite keys" do
     @Album.filter(:calbum_info=>@AlbumInfo.load(:album_id2=>4)).sql.should == 'SELECT * FROM albums WHERE \'f\'' 
     @Album.filter(:calbum_info=>@AlbumInfo.load(:album_id1=>3)).sql.should == 'SELECT * FROM albums WHERE \'f\'' 
     @Album.filter(:calbum_info=>@AlbumInfo.new).sql.should == 'SELECT * FROM albums WHERE \'f\'' 
   end
 
-  it "should be able to filtering with NULL values for many_to_many associations with composite keys" do
+  it "should be able to filter with NULL values for many_to_many associations with composite keys" do
     @Album.filter(:ctags=>@Tag.load(:tid1=>3)).sql.should == 'SELECT * FROM albums WHERE \'f\''
     @Album.filter(:ctags=>@Tag.load(:tid2=>4)).sql.should == 'SELECT * FROM albums WHERE \'f\''
     @Album.filter(:ctags=>@Tag.new).sql.should == 'SELECT * FROM albums WHERE \'f\''
@@ -2761,147 +2788,147 @@ describe "Filtering by associations" do
   end
 
   it "should be able to handle NULL values when filtering multiple many_to_one associations" do
-    @Album.filter(:artist=>[@Artist.load(:id=>3), @Artist.new]).sql.should == 'SELECT * FROM albums WHERE (artist_id IN (3))'
+    @Album.filter(:artist=>[@Artist.load(:id=>3), @Artist.new]).sql.should == 'SELECT * FROM albums WHERE (albums.artist_id IN (3))'
     @Album.filter(:artist=>[@Artist.new, @Artist.new]).sql.should == 'SELECT * FROM albums WHERE \'f\''
   end
 
   it "should be able to handle NULL values when filtering multiple one_to_many associations" do
-    @Album.filter(:tracks=>[@Track.load(:album_id=>3), @Track.new]).sql.should == 'SELECT * FROM albums WHERE (id IN (3))'
+    @Album.filter(:tracks=>[@Track.load(:album_id=>3), @Track.new]).sql.should == 'SELECT * FROM albums WHERE (albums.id IN (3))'
     @Album.filter(:tracks=>[@Track.new, @Track.new]).sql.should == 'SELECT * FROM albums WHERE \'f\''
   end
 
   it "should be able to handle NULL values when filtering multiple one_to_one associations" do
-    @Album.filter(:album_info=>[@AlbumInfo.load(:album_id=>3), @AlbumInfo.new]).sql.should == 'SELECT * FROM albums WHERE (id IN (3))'
+    @Album.filter(:album_info=>[@AlbumInfo.load(:album_id=>3), @AlbumInfo.new]).sql.should == 'SELECT * FROM albums WHERE (albums.id IN (3))'
     @Album.filter(:album_info=>[@AlbumInfo.new, @AlbumInfo.new]).sql.should == 'SELECT * FROM albums WHERE \'f\''
   end
 
   it "should be able to handle NULL values when filtering multiple many_to_many associations" do
-    @Album.filter(:tags=>[@Tag.load(:id=>3), @Tag.new]).sql.should == 'SELECT * FROM albums WHERE (id IN (SELECT album_id FROM albums_tags WHERE ((tag_id IN (3)) AND (album_id IS NOT NULL))))'
+    @Album.filter(:tags=>[@Tag.load(:id=>3), @Tag.new]).sql.should == 'SELECT * FROM albums WHERE (albums.id IN (SELECT albums_tags.album_id FROM albums_tags WHERE ((albums_tags.tag_id IN (3)) AND (albums_tags.album_id IS NOT NULL))))'
     @Album.filter(:tags=>[@Tag.new, @Tag.new]).sql.should == 'SELECT * FROM albums WHERE \'f\''
   end
 
   it "should be able to handle NULL values when filtering multiple many_to_one associations with composite keys" do
-    @Album.filter(:cartist=>[@Artist.load(:id1=>3, :id2=>4), @Artist.load(:id1=>3)]).sql.should == 'SELECT * FROM albums WHERE ((artist_id1, artist_id2) IN ((3, 4)))'
-    @Album.filter(:cartist=>[@Artist.load(:id1=>3, :id2=>4), @Artist.new]).sql.should == 'SELECT * FROM albums WHERE ((artist_id1, artist_id2) IN ((3, 4)))'
+    @Album.filter(:cartist=>[@Artist.load(:id1=>3, :id2=>4), @Artist.load(:id1=>3)]).sql.should == 'SELECT * FROM albums WHERE ((albums.artist_id1, albums.artist_id2) IN ((3, 4)))'
+    @Album.filter(:cartist=>[@Artist.load(:id1=>3, :id2=>4), @Artist.new]).sql.should == 'SELECT * FROM albums WHERE ((albums.artist_id1, albums.artist_id2) IN ((3, 4)))'
   end
 
   it "should be able handle NULL values when filtering multiple one_to_many associations with composite keys" do
-    @Album.filter(:ctracks=>[@Track.load(:album_id1=>3, :album_id2=>4), @Track.load(:album_id1=>3)]).sql.should == 'SELECT * FROM albums WHERE ((id1, id2) IN ((3, 4)))'
-    @Album.filter(:ctracks=>[@Track.load(:album_id1=>3, :album_id2=>4), @Track.new]).sql.should == 'SELECT * FROM albums WHERE ((id1, id2) IN ((3, 4)))'
+    @Album.filter(:ctracks=>[@Track.load(:album_id1=>3, :album_id2=>4), @Track.load(:album_id1=>3)]).sql.should == 'SELECT * FROM albums WHERE ((albums.id1, albums.id2) IN ((3, 4)))'
+    @Album.filter(:ctracks=>[@Track.load(:album_id1=>3, :album_id2=>4), @Track.new]).sql.should == 'SELECT * FROM albums WHERE ((albums.id1, albums.id2) IN ((3, 4)))'
   end
 
   it "should be able to handle NULL values when filtering multiple one_to_one associations with composite keys" do
-    @Album.filter(:calbum_info=>[@AlbumInfo.load(:album_id1=>3, :album_id2=>4), @AlbumInfo.load(:album_id1=>5)]).sql.should == 'SELECT * FROM albums WHERE ((id1, id2) IN ((3, 4)))' 
-    @Album.filter(:calbum_info=>[@AlbumInfo.load(:album_id1=>3, :album_id2=>4), @AlbumInfo.new]).sql.should == 'SELECT * FROM albums WHERE ((id1, id2) IN ((3, 4)))' 
+    @Album.filter(:calbum_info=>[@AlbumInfo.load(:album_id1=>3, :album_id2=>4), @AlbumInfo.load(:album_id1=>5)]).sql.should == 'SELECT * FROM albums WHERE ((albums.id1, albums.id2) IN ((3, 4)))' 
+    @Album.filter(:calbum_info=>[@AlbumInfo.load(:album_id1=>3, :album_id2=>4), @AlbumInfo.new]).sql.should == 'SELECT * FROM albums WHERE ((albums.id1, albums.id2) IN ((3, 4)))' 
   end
 
   it "should be able to handle NULL values when filtering multiple many_to_many associations with composite keys" do
-    @Album.filter(:ctags=>[@Tag.load(:tid1=>3, :tid2=>4), @Tag.load(:tid1=>5)]).sql.should == 'SELECT * FROM albums WHERE ((id1, id2) IN (SELECT album_id1, album_id2 FROM albums_tags WHERE (((tag_id1, tag_id2) IN ((3, 4))) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL))))'
-    @Album.filter(:ctags=>[@Tag.load(:tid1=>3, :tid2=>4), @Tag.new]).sql.should == 'SELECT * FROM albums WHERE ((id1, id2) IN (SELECT album_id1, album_id2 FROM albums_tags WHERE (((tag_id1, tag_id2) IN ((3, 4))) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL))))'
+    @Album.filter(:ctags=>[@Tag.load(:tid1=>3, :tid2=>4), @Tag.load(:tid1=>5)]).sql.should == 'SELECT * FROM albums WHERE ((albums.id1, albums.id2) IN (SELECT albums_tags.album_id1, albums_tags.album_id2 FROM albums_tags WHERE (((albums_tags.tag_id1, albums_tags.tag_id2) IN ((3, 4))) AND (albums_tags.album_id1 IS NOT NULL) AND (albums_tags.album_id2 IS NOT NULL))))'
+    @Album.filter(:ctags=>[@Tag.load(:tid1=>3, :tid2=>4), @Tag.new]).sql.should == 'SELECT * FROM albums WHERE ((albums.id1, albums.id2) IN (SELECT albums_tags.album_id1, albums_tags.album_id2 FROM albums_tags WHERE (((albums_tags.tag_id1, albums_tags.tag_id2) IN ((3, 4))) AND (albums_tags.album_id1 IS NOT NULL) AND (albums_tags.album_id2 IS NOT NULL))))'
   end
 
   it "should be able to handle NULL values when excluding multiple many_to_one associations" do
-    @Album.exclude(:artist=>[@Artist.load(:id=>3), @Artist.new]).sql.should == 'SELECT * FROM albums WHERE ((artist_id NOT IN (3)) OR (artist_id IS NULL))'
+    @Album.exclude(:artist=>[@Artist.load(:id=>3), @Artist.new]).sql.should == 'SELECT * FROM albums WHERE ((albums.artist_id NOT IN (3)) OR (albums.artist_id IS NULL))'
     @Album.exclude(:artist=>[@Artist.new, @Artist.new]).sql.should == 'SELECT * FROM albums WHERE \'t\''
   end
 
   it "should be able to handle NULL values when excluding multiple one_to_many associations" do
-    @Album.exclude(:tracks=>[@Track.load(:album_id=>3), @Track.new]).sql.should == 'SELECT * FROM albums WHERE ((id NOT IN (3)) OR (id IS NULL))'
+    @Album.exclude(:tracks=>[@Track.load(:album_id=>3), @Track.new]).sql.should == 'SELECT * FROM albums WHERE ((albums.id NOT IN (3)) OR (albums.id IS NULL))'
     @Album.exclude(:tracks=>[@Track.new, @Track.new]).sql.should == 'SELECT * FROM albums WHERE \'t\''
   end
 
   it "should be able to handle NULL values when excluding multiple one_to_one associations" do
-    @Album.exclude(:album_info=>[@AlbumInfo.load(:album_id=>3), @AlbumInfo.new]).sql.should == 'SELECT * FROM albums WHERE ((id NOT IN (3)) OR (id IS NULL))'
+    @Album.exclude(:album_info=>[@AlbumInfo.load(:album_id=>3), @AlbumInfo.new]).sql.should == 'SELECT * FROM albums WHERE ((albums.id NOT IN (3)) OR (albums.id IS NULL))'
     @Album.exclude(:album_info=>[@AlbumInfo.new, @AlbumInfo.new]).sql.should == 'SELECT * FROM albums WHERE \'t\''
   end
 
   it "should be able to handle NULL values when excluding multiple many_to_many associations" do
-    @Album.exclude(:tags=>[@Tag.load(:id=>3), @Tag.new]).sql.should == 'SELECT * FROM albums WHERE ((id NOT IN (SELECT album_id FROM albums_tags WHERE ((tag_id IN (3)) AND (album_id IS NOT NULL)))) OR (id IS NULL))'
+    @Album.exclude(:tags=>[@Tag.load(:id=>3), @Tag.new]).sql.should == 'SELECT * FROM albums WHERE ((albums.id NOT IN (SELECT albums_tags.album_id FROM albums_tags WHERE ((albums_tags.tag_id IN (3)) AND (albums_tags.album_id IS NOT NULL)))) OR (albums.id IS NULL))'
     @Album.exclude(:tags=>[@Tag.new, @Tag.new]).sql.should == 'SELECT * FROM albums WHERE \'t\''
   end
 
   it "should be able to handle NULL values when excluding multiple many_to_one associations with composite keys" do
-    @Album.exclude(:cartist=>[@Artist.load(:id1=>3, :id2=>4), @Artist.load(:id1=>3)]).sql.should == 'SELECT * FROM albums WHERE (((artist_id1, artist_id2) NOT IN ((3, 4))) OR (artist_id1 IS NULL) OR (artist_id2 IS NULL))'
-    @Album.exclude(:cartist=>[@Artist.load(:id1=>3, :id2=>4), @Artist.new]).sql.should == 'SELECT * FROM albums WHERE (((artist_id1, artist_id2) NOT IN ((3, 4))) OR (artist_id1 IS NULL) OR (artist_id2 IS NULL))'
+    @Album.exclude(:cartist=>[@Artist.load(:id1=>3, :id2=>4), @Artist.load(:id1=>3)]).sql.should == 'SELECT * FROM albums WHERE (((albums.artist_id1, albums.artist_id2) NOT IN ((3, 4))) OR (albums.artist_id1 IS NULL) OR (albums.artist_id2 IS NULL))'
+    @Album.exclude(:cartist=>[@Artist.load(:id1=>3, :id2=>4), @Artist.new]).sql.should == 'SELECT * FROM albums WHERE (((albums.artist_id1, albums.artist_id2) NOT IN ((3, 4))) OR (albums.artist_id1 IS NULL) OR (albums.artist_id2 IS NULL))'
   end
 
   it "should be able handle NULL values when excluding multiple one_to_many associations with composite keys" do
-    @Album.exclude(:ctracks=>[@Track.load(:album_id1=>3, :album_id2=>4), @Track.load(:album_id1=>3)]).sql.should == 'SELECT * FROM albums WHERE (((id1, id2) NOT IN ((3, 4))) OR (id1 IS NULL) OR (id2 IS NULL))'
-    @Album.exclude(:ctracks=>[@Track.load(:album_id1=>3, :album_id2=>4), @Track.new]).sql.should == 'SELECT * FROM albums WHERE (((id1, id2) NOT IN ((3, 4))) OR (id1 IS NULL) OR (id2 IS NULL))'
+    @Album.exclude(:ctracks=>[@Track.load(:album_id1=>3, :album_id2=>4), @Track.load(:album_id1=>3)]).sql.should == 'SELECT * FROM albums WHERE (((albums.id1, albums.id2) NOT IN ((3, 4))) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))'
+    @Album.exclude(:ctracks=>[@Track.load(:album_id1=>3, :album_id2=>4), @Track.new]).sql.should == 'SELECT * FROM albums WHERE (((albums.id1, albums.id2) NOT IN ((3, 4))) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))'
   end
 
   it "should be able to handle NULL values when excluding multiple one_to_one associations with composite keys" do
-    @Album.exclude(:calbum_info=>[@AlbumInfo.load(:album_id1=>3, :album_id2=>4), @AlbumInfo.load(:album_id1=>5)]).sql.should == 'SELECT * FROM albums WHERE (((id1, id2) NOT IN ((3, 4))) OR (id1 IS NULL) OR (id2 IS NULL))' 
-    @Album.exclude(:calbum_info=>[@AlbumInfo.load(:album_id1=>3, :album_id2=>4), @AlbumInfo.new]).sql.should == 'SELECT * FROM albums WHERE (((id1, id2) NOT IN ((3, 4))) OR (id1 IS NULL) OR (id2 IS NULL))' 
+    @Album.exclude(:calbum_info=>[@AlbumInfo.load(:album_id1=>3, :album_id2=>4), @AlbumInfo.load(:album_id1=>5)]).sql.should == 'SELECT * FROM albums WHERE (((albums.id1, albums.id2) NOT IN ((3, 4))) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))' 
+    @Album.exclude(:calbum_info=>[@AlbumInfo.load(:album_id1=>3, :album_id2=>4), @AlbumInfo.new]).sql.should == 'SELECT * FROM albums WHERE (((albums.id1, albums.id2) NOT IN ((3, 4))) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))' 
   end
 
   it "should be able to handle NULL values when excluding multiple many_to_many associations with composite keys" do
-    @Album.exclude(:ctags=>[@Tag.load(:tid1=>3, :tid2=>4), @Tag.load(:tid1=>5)]).sql.should == 'SELECT * FROM albums WHERE (((id1, id2) NOT IN (SELECT album_id1, album_id2 FROM albums_tags WHERE (((tag_id1, tag_id2) IN ((3, 4))) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL)))) OR (id1 IS NULL) OR (id2 IS NULL))'
-    @Album.exclude(:ctags=>[@Tag.load(:tid1=>3, :tid2=>4), @Tag.new]).sql.should == 'SELECT * FROM albums WHERE (((id1, id2) NOT IN (SELECT album_id1, album_id2 FROM albums_tags WHERE (((tag_id1, tag_id2) IN ((3, 4))) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL)))) OR (id1 IS NULL) OR (id2 IS NULL))'
+    @Album.exclude(:ctags=>[@Tag.load(:tid1=>3, :tid2=>4), @Tag.load(:tid1=>5)]).sql.should == 'SELECT * FROM albums WHERE (((albums.id1, albums.id2) NOT IN (SELECT albums_tags.album_id1, albums_tags.album_id2 FROM albums_tags WHERE (((albums_tags.tag_id1, albums_tags.tag_id2) IN ((3, 4))) AND (albums_tags.album_id1 IS NOT NULL) AND (albums_tags.album_id2 IS NOT NULL)))) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))'
+    @Album.exclude(:ctags=>[@Tag.load(:tid1=>3, :tid2=>4), @Tag.new]).sql.should == 'SELECT * FROM albums WHERE (((albums.id1, albums.id2) NOT IN (SELECT albums_tags.album_id1, albums_tags.album_id2 FROM albums_tags WHERE (((albums_tags.tag_id1, albums_tags.tag_id2) IN ((3, 4))) AND (albums_tags.album_id1 IS NOT NULL) AND (albums_tags.album_id2 IS NOT NULL)))) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))'
   end
 
   it "should be able to filter on many_to_one association datasets" do
-    @Album.filter(:artist=>@Artist.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (artist_id IN (SELECT id FROM artists WHERE ((x = 1) AND (id IS NOT NULL))))'
+    @Album.filter(:artist=>@Artist.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (albums.artist_id IN (SELECT artists.id FROM artists WHERE ((x = 1) AND (artists.id IS NOT NULL))))'
   end
 
   it "should be able to filter on one_to_many association datasets" do
-    @Album.filter(:tracks=>@Track.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (id IN (SELECT album_id FROM tracks WHERE ((x = 1) AND (album_id IS NOT NULL))))'
+    @Album.filter(:tracks=>@Track.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (albums.id IN (SELECT tracks.album_id FROM tracks WHERE ((x = 1) AND (tracks.album_id IS NOT NULL))))'
   end
 
   it "should be able to filter on one_to_one association datasets" do
-    @Album.filter(:album_info=>@AlbumInfo.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (id IN (SELECT album_id FROM album_infos WHERE ((x = 1) AND (album_id IS NOT NULL))))'
+    @Album.filter(:album_info=>@AlbumInfo.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (albums.id IN (SELECT album_infos.album_id FROM album_infos WHERE ((x = 1) AND (album_infos.album_id IS NOT NULL))))'
   end
 
   it "should be able to filter on many_to_many association datasets" do
-    @Album.filter(:tags=>@Tag.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (id IN (SELECT album_id FROM albums_tags WHERE ((tag_id IN (SELECT id FROM tags WHERE ((x = 1) AND (id IS NOT NULL)))) AND (album_id IS NOT NULL))))'
+    @Album.filter(:tags=>@Tag.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (albums.id IN (SELECT albums_tags.album_id FROM albums_tags WHERE ((albums_tags.tag_id IN (SELECT tags.id FROM tags WHERE ((x = 1) AND (tags.id IS NOT NULL)))) AND (albums_tags.album_id IS NOT NULL))))'
   end
 
   it "should be able to filter on many_to_one association datasets with composite keys" do
-    @Album.filter(:cartist=>@Artist.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((artist_id1, artist_id2) IN (SELECT id1, id2 FROM artists WHERE ((x = 1) AND (id1 IS NOT NULL) AND (id2 IS NOT NULL))))'
+    @Album.filter(:cartist=>@Artist.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((albums.artist_id1, albums.artist_id2) IN (SELECT artists.id1, artists.id2 FROM artists WHERE ((x = 1) AND (artists.id1 IS NOT NULL) AND (artists.id2 IS NOT NULL))))'
   end
 
   it "should be able to filter on one_to_many association datasets with composite keys" do
-    @Album.filter(:ctracks=>@Track.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((id1, id2) IN (SELECT album_id1, album_id2 FROM tracks WHERE ((x = 1) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL))))'
+    @Album.filter(:ctracks=>@Track.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((albums.id1, albums.id2) IN (SELECT tracks.album_id1, tracks.album_id2 FROM tracks WHERE ((x = 1) AND (tracks.album_id1 IS NOT NULL) AND (tracks.album_id2 IS NOT NULL))))'
   end
 
   it "should be able to filter on one_to_one association datasets with composite keys" do
-    @Album.filter(:calbum_info=>@AlbumInfo.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((id1, id2) IN (SELECT album_id1, album_id2 FROM album_infos WHERE ((x = 1) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL))))'
+    @Album.filter(:calbum_info=>@AlbumInfo.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((albums.id1, albums.id2) IN (SELECT album_infos.album_id1, album_infos.album_id2 FROM album_infos WHERE ((x = 1) AND (album_infos.album_id1 IS NOT NULL) AND (album_infos.album_id2 IS NOT NULL))))'
   end
 
   it "should be able to filter on many_to_many association datasets with composite keys" do
-    @Album.filter(:ctags=>@Tag.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((id1, id2) IN (SELECT album_id1, album_id2 FROM albums_tags WHERE (((tag_id1, tag_id2) IN (SELECT tid1, tid2 FROM tags WHERE ((x = 1) AND (tid1 IS NOT NULL) AND (tid2 IS NOT NULL)))) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL))))'
+    @Album.filter(:ctags=>@Tag.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((albums.id1, albums.id2) IN (SELECT albums_tags.album_id1, albums_tags.album_id2 FROM albums_tags WHERE (((albums_tags.tag_id1, albums_tags.tag_id2) IN (SELECT tags.tid1, tags.tid2 FROM tags WHERE ((x = 1) AND (tags.tid1 IS NOT NULL) AND (tags.tid2 IS NOT NULL)))) AND (albums_tags.album_id1 IS NOT NULL) AND (albums_tags.album_id2 IS NOT NULL))))'
   end
 
   it "should be able to exclude on many_to_one association datasets" do
-    @Album.exclude(:artist=>@Artist.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((artist_id NOT IN (SELECT id FROM artists WHERE ((x = 1) AND (id IS NOT NULL)))) OR (artist_id IS NULL))'
+    @Album.exclude(:artist=>@Artist.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((albums.artist_id NOT IN (SELECT artists.id FROM artists WHERE ((x = 1) AND (artists.id IS NOT NULL)))) OR (albums.artist_id IS NULL))'
   end
 
   it "should be able to exclude on one_to_many association datasets" do
-    @Album.exclude(:tracks=>@Track.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((id NOT IN (SELECT album_id FROM tracks WHERE ((x = 1) AND (album_id IS NOT NULL)))) OR (id IS NULL))'
+    @Album.exclude(:tracks=>@Track.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((albums.id NOT IN (SELECT tracks.album_id FROM tracks WHERE ((x = 1) AND (tracks.album_id IS NOT NULL)))) OR (albums.id IS NULL))'
   end
 
   it "should be able to exclude on one_to_one association datasets" do
-    @Album.exclude(:album_info=>@AlbumInfo.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((id NOT IN (SELECT album_id FROM album_infos WHERE ((x = 1) AND (album_id IS NOT NULL)))) OR (id IS NULL))'
+    @Album.exclude(:album_info=>@AlbumInfo.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((albums.id NOT IN (SELECT album_infos.album_id FROM album_infos WHERE ((x = 1) AND (album_infos.album_id IS NOT NULL)))) OR (albums.id IS NULL))'
   end
 
   it "should be able to exclude on many_to_many association datasets" do
-    @Album.exclude(:tags=>@Tag.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((id NOT IN (SELECT album_id FROM albums_tags WHERE ((tag_id IN (SELECT id FROM tags WHERE ((x = 1) AND (id IS NOT NULL)))) AND (album_id IS NOT NULL)))) OR (id IS NULL))'
+    @Album.exclude(:tags=>@Tag.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE ((albums.id NOT IN (SELECT albums_tags.album_id FROM albums_tags WHERE ((albums_tags.tag_id IN (SELECT tags.id FROM tags WHERE ((x = 1) AND (tags.id IS NOT NULL)))) AND (albums_tags.album_id IS NOT NULL)))) OR (albums.id IS NULL))'
   end
 
   it "should be able to exclude on many_to_one association datasets with composite keys" do
-    @Album.exclude(:cartist=>@Artist.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (((artist_id1, artist_id2) NOT IN (SELECT id1, id2 FROM artists WHERE ((x = 1) AND (id1 IS NOT NULL) AND (id2 IS NOT NULL)))) OR (artist_id1 IS NULL) OR (artist_id2 IS NULL))'
+    @Album.exclude(:cartist=>@Artist.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (((albums.artist_id1, albums.artist_id2) NOT IN (SELECT artists.id1, artists.id2 FROM artists WHERE ((x = 1) AND (artists.id1 IS NOT NULL) AND (artists.id2 IS NOT NULL)))) OR (albums.artist_id1 IS NULL) OR (albums.artist_id2 IS NULL))'
   end
 
   it "should be able to exclude on one_to_many association datasets with composite keys" do
-    @Album.exclude(:ctracks=>@Track.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (((id1, id2) NOT IN (SELECT album_id1, album_id2 FROM tracks WHERE ((x = 1) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL)))) OR (id1 IS NULL) OR (id2 IS NULL))'
+    @Album.exclude(:ctracks=>@Track.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (((albums.id1, albums.id2) NOT IN (SELECT tracks.album_id1, tracks.album_id2 FROM tracks WHERE ((x = 1) AND (tracks.album_id1 IS NOT NULL) AND (tracks.album_id2 IS NOT NULL)))) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))'
   end
 
   it "should be able to exclude on one_to_one association datasets with composite keys" do
-    @Album.exclude(:calbum_info=>@AlbumInfo.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (((id1, id2) NOT IN (SELECT album_id1, album_id2 FROM album_infos WHERE ((x = 1) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL)))) OR (id1 IS NULL) OR (id2 IS NULL))'
+    @Album.exclude(:calbum_info=>@AlbumInfo.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (((albums.id1, albums.id2) NOT IN (SELECT album_infos.album_id1, album_infos.album_id2 FROM album_infos WHERE ((x = 1) AND (album_infos.album_id1 IS NOT NULL) AND (album_infos.album_id2 IS NOT NULL)))) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))'
   end
 
   it "should be able to exclude on many_to_many association datasets with composite keys" do
-    @Album.exclude(:ctags=>@Tag.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (((id1, id2) NOT IN (SELECT album_id1, album_id2 FROM albums_tags WHERE (((tag_id1, tag_id2) IN (SELECT tid1, tid2 FROM tags WHERE ((x = 1) AND (tid1 IS NOT NULL) AND (tid2 IS NOT NULL)))) AND (album_id1 IS NOT NULL) AND (album_id2 IS NOT NULL)))) OR (id1 IS NULL) OR (id2 IS NULL))'
+    @Album.exclude(:ctags=>@Tag.filter(:x=>1)).sql.should == 'SELECT * FROM albums WHERE (((albums.id1, albums.id2) NOT IN (SELECT albums_tags.album_id1, albums_tags.album_id2 FROM albums_tags WHERE (((albums_tags.tag_id1, albums_tags.tag_id2) IN (SELECT tags.tid1, tags.tid2 FROM tags WHERE ((x = 1) AND (tags.tid1 IS NOT NULL) AND (tags.tid2 IS NOT NULL)))) AND (albums_tags.album_id1 IS NOT NULL) AND (albums_tags.album_id2 IS NOT NULL)))) OR (albums.id1 IS NULL) OR (albums.id2 IS NULL))'
   end
 
   it "should do a regular IN query if the dataset for a different model is used" do
@@ -2910,5 +2937,303 @@ describe "Filtering by associations" do
 
   it "should do a regular IN query if a non-model dataset is used" do
     @Album.filter(:artist=>@Album.db.from(:albums).select(:x)).sql.should == 'SELECT * FROM albums WHERE (artist IN (SELECT x FROM albums))'
+  end
+end
+
+describe "Sequel::Model Associations with clashing column names" do
+  before do
+    @db = Sequel.mock(:fetch=>{:id=>1, :object_id=>2})
+    @Foo = Class.new(Sequel::Model(@db[:foos]))
+    @Bar = Class.new(Sequel::Model(@db[:bars]))
+    @Foo.columns :id, :object_id
+    @Bar.columns :id, :object_id
+    @Foo.def_column_alias(:obj_id, :object_id)
+    @Bar.def_column_alias(:obj_id, :object_id)
+    @Foo.one_to_many :bars, :primary_key=>:obj_id, :primary_key_column=>:object_id, :key=>:object_id, :key_method=>:obj_id,  :class=>@Bar
+    @Foo.one_to_one :bar, :primary_key=>:obj_id, :primary_key_column=>:object_id, :key=>:object_id, :key_method=>:obj_id, :class=>@Bar
+    @Bar.many_to_one :foo, :key=>:obj_id, :key_column=>:object_id, :primary_key=>:object_id, :primary_key_method=>:obj_id, :class=>@Foo
+    @Foo.many_to_many :mtmbars, :join_table=>:bars_foos, :left_primary_key=>:obj_id, :left_primary_key_column=>:object_id, :right_primary_key=>:object_id, :right_primary_key_method=>:obj_id, :left_key=>:foo_id, :right_key=>:object_id, :class=>@Bar
+    @Bar.many_to_many :mtmfoos, :join_table=>:bars_foos, :left_primary_key=>:obj_id, :left_primary_key_column=>:object_id, :right_primary_key=>:object_id, :right_primary_key_method=>:obj_id, :left_key=>:object_id, :right_key=>:foo_id, :class=>@Foo
+    @foo = @Foo.load(:id=>1, :object_id=>2)
+    @bar = @Bar.load(:id=>1, :object_id=>2)
+    @db.sqls
+  end
+
+  it "should have working regular association methods" do
+    @Bar.first.foo.should == @foo
+    @db.sqls.should == ["SELECT * FROM bars LIMIT 1", "SELECT * FROM foos WHERE (foos.object_id = 2) LIMIT 1"]
+    @Foo.first.bars.should == [@bar]
+    @db.sqls.should == ["SELECT * FROM foos LIMIT 1", "SELECT * FROM bars WHERE (bars.object_id = 2)"]
+    @Foo.first.bar.should == @bar
+    @db.sqls.should == ["SELECT * FROM foos LIMIT 1", "SELECT * FROM bars WHERE (bars.object_id = 2) LIMIT 1"]
+    @Foo.first.mtmbars.should == [@bar]
+    @db.sqls.should == ["SELECT * FROM foos LIMIT 1", "SELECT bars.* FROM bars INNER JOIN bars_foos ON ((bars_foos.object_id = bars.object_id) AND (bars_foos.foo_id = 2))"]
+    @Bar.first.mtmfoos.should == [@foo]
+    @db.sqls.should == ["SELECT * FROM bars LIMIT 1", "SELECT foos.* FROM foos INNER JOIN bars_foos ON ((bars_foos.foo_id = foos.object_id) AND (bars_foos.object_id = 2))"]
+  end
+
+  it "should have working eager loading methods" do
+    @Bar.eager(:foo).all.map{|o| [o, o.foo]}.should == [[@bar, @foo]]
+    @db.sqls.should == ["SELECT * FROM bars", "SELECT * FROM foos WHERE (foos.object_id IN (2))"]
+    @Foo.eager(:bars).all.map{|o| [o, o.bars]}.should == [[@foo, [@bar]]]
+    @db.sqls.should == ["SELECT * FROM foos", "SELECT * FROM bars WHERE (bars.object_id IN (2))"]
+    @Foo.eager(:bar).all.map{|o| [o, o.bar]}.should == [[@foo, @bar]]
+    @db.sqls.should == ["SELECT * FROM foos", "SELECT * FROM bars WHERE (bars.object_id IN (2))"]
+    @db.fetch = [[{:id=>1, :object_id=>2}], [{:id=>1, :object_id=>2, :x_foreign_key_x=>2}]]
+    @Foo.eager(:mtmbars).all.map{|o| [o, o.mtmbars]}.should == [[@foo, [@bar]]]
+    @db.sqls.should == ["SELECT * FROM foos", "SELECT bars.*, bars_foos.foo_id AS x_foreign_key_x FROM bars INNER JOIN bars_foos ON ((bars_foos.object_id = bars.object_id) AND (bars_foos.foo_id IN (2)))"]
+    @db.fetch = [[{:id=>1, :object_id=>2}], [{:id=>1, :object_id=>2, :x_foreign_key_x=>2}]]
+    @Bar.eager(:mtmfoos).all.map{|o| [o, o.mtmfoos]}.should == [[@bar, [@foo]]]
+    @db.sqls.should == ["SELECT * FROM bars", "SELECT foos.*, bars_foos.object_id AS x_foreign_key_x FROM foos INNER JOIN bars_foos ON ((bars_foos.foo_id = foos.object_id) AND (bars_foos.object_id IN (2)))"]
+  end
+
+  it "should have working eager graphing methods" do
+    @db.fetch = {:id=>1, :object_id=>2, :foo_id=>1, :foo_object_id=>2}
+    @Bar.eager_graph(:foo).all.map{|o| [o, o.foo]}.should == [[@bar, @foo]]
+    @db.sqls.should == ["SELECT bars.id, bars.object_id, foo.id AS foo_id, foo.object_id AS foo_object_id FROM bars LEFT OUTER JOIN foos AS foo ON (foo.object_id = bars.object_id)"]
+    @db.fetch = {:id=>1, :object_id=>2, :bars_id=>1, :bars_object_id=>2}
+    @Foo.eager_graph(:bars).all.map{|o| [o, o.bars]}.should == [[@foo, [@bar]]]
+    @db.sqls.should == ["SELECT foos.id, foos.object_id, bars.id AS bars_id, bars.object_id AS bars_object_id FROM foos LEFT OUTER JOIN bars ON (bars.object_id = foos.object_id)"]
+    @db.fetch = {:id=>1, :object_id=>2, :bar_id=>1, :bar_object_id=>2}
+    @Foo.eager_graph(:bar).all.map{|o| [o, o.bar]}.should == [[@foo, @bar]]
+    @db.sqls.should == ["SELECT foos.id, foos.object_id, bar.id AS bar_id, bar.object_id AS bar_object_id FROM foos LEFT OUTER JOIN bars AS bar ON (bar.object_id = foos.object_id)"]
+    @db.fetch = {:id=>1, :object_id=>2, :mtmfoos_id=>1, :mtmfoos_object_id=>2}
+    @Bar.eager_graph(:mtmfoos).all.map{|o| [o, o.mtmfoos]}.should == [[@bar, [@foo]]]
+    @db.sqls.should == ["SELECT bars.id, bars.object_id, mtmfoos.id AS mtmfoos_id, mtmfoos.object_id AS mtmfoos_object_id FROM bars LEFT OUTER JOIN bars_foos ON (bars_foos.object_id = bars.object_id) LEFT OUTER JOIN foos AS mtmfoos ON (mtmfoos.object_id = bars_foos.foo_id)"]
+    @db.fetch = {:id=>1, :object_id=>2, :mtmbars_id=>1, :mtmbars_object_id=>2}
+    @Foo.eager_graph(:mtmbars).all.map{|o| [o, o.mtmbars]}.should == [[@foo, [@bar]]]
+    @db.sqls.should == ["SELECT foos.id, foos.object_id, mtmbars.id AS mtmbars_id, mtmbars.object_id AS mtmbars_object_id FROM foos LEFT OUTER JOIN bars_foos ON (bars_foos.foo_id = foos.object_id) LEFT OUTER JOIN bars AS mtmbars ON (mtmbars.object_id = bars_foos.object_id)"]
+  end
+
+  it "should have working filter by associations with model instances" do
+    @Bar.first(:foo=>@foo).should == @bar
+    @db.sqls.should == ["SELECT * FROM bars WHERE (bars.object_id = 2) LIMIT 1"]
+    @Foo.first(:bars=>@bar).should == @foo
+    @db.sqls.should == ["SELECT * FROM foos WHERE (foos.object_id = 2) LIMIT 1"]
+    @Foo.first(:bar=>@bar).should == @foo
+    @db.sqls.should == ["SELECT * FROM foos WHERE (foos.object_id = 2) LIMIT 1"]
+    @Foo.first(:mtmbars=>@bar).should == @foo
+    @db.sqls.should == ["SELECT * FROM foos WHERE (foos.object_id IN (SELECT bars_foos.foo_id FROM bars_foos WHERE ((bars_foos.object_id = 2) AND (bars_foos.foo_id IS NOT NULL)))) LIMIT 1"]
+    @Bar.first(:mtmfoos=>@foo).should == @bar
+    @db.sqls.should == ["SELECT * FROM bars WHERE (bars.object_id IN (SELECT bars_foos.object_id FROM bars_foos WHERE ((bars_foos.foo_id = 2) AND (bars_foos.object_id IS NOT NULL)))) LIMIT 1"]
+  end
+
+  it "should have working modification methods" do
+    b = @Bar.load(:id=>2, :object_id=>3)
+    f = @Foo.load(:id=>2, :object_id=>3)
+    @db.numrows = 1
+
+    @bar.foo = f
+    @bar.obj_id.should == 3
+    @foo.bar = @bar
+    @bar.obj_id.should == 2
+
+    @foo.add_bar(b)
+    @db.fetch = [[{:id=>1, :object_id=>2}, {:id=>2, :object_id=>2}], [{:id=>1, :object_id=>2}]]
+    @foo.bars.should == [@bar, b]
+    @foo.remove_bar(b)
+    @foo.bars.should == [@bar]
+    @foo.remove_all_bars
+    @foo.bars.should == []
+
+    @db.fetch = [[{:id=>1, :object_id=>2}], [], [{:id=>2, :object_id=>2}]]
+    @bar = @Bar.load(:id=>1, :object_id=>2)
+    @foo.mtmbars.should == [@bar]
+    @foo.remove_all_mtmbars
+    @foo.mtmbars.should == []
+    @foo.add_mtmbar(b)
+    @foo.mtmbars.should == [b]
+    @foo.remove_mtmbar(b)
+    @foo.mtmbars.should == []
+
+    @db.fetch = [[{:id=>2, :object_id=>3}], [], [{:id=>2, :object_id=>3}]]
+    @bar.add_mtmfoo(f)
+    @bar.mtmfoos.should == [f]
+    @bar.remove_all_mtmfoos
+    @bar.mtmfoos.should == []
+    @bar.add_mtmfoo(f)
+    @bar.mtmfoos.should == [f]
+    @bar.remove_mtmfoo(f)
+    @bar.mtmfoos.should == []
+  end
+end 
+
+describe "Sequel::Model Associations with non-column expression keys" do
+  before do
+    @db = Sequel.mock(:fetch=>{:id=>1, :object_ids=>[2]})
+    @Foo = Class.new(Sequel::Model(@db[:foos]))
+    @Bar = Class.new(Sequel::Model(@db[:bars]))
+    @Foo.columns :id, :object_ids
+    @Bar.columns :id, :object_ids
+    m = Module.new{def obj_id; object_ids[0]; end}
+    @Foo.include m
+    @Bar.include m
+
+    @Foo.one_to_many :bars, :primary_key=>:obj_id, :primary_key_column=>Sequel.subscript(:object_ids, 0), :key=>Sequel.subscript(:object_ids, 0), :key_method=>:obj_id,  :class=>@Bar
+    @Foo.one_to_one :bar, :primary_key=>:obj_id, :primary_key_column=>Sequel.subscript(:object_ids, 0), :key=>Sequel.subscript(:object_ids, 0), :key_method=>:obj_id, :class=>@Bar
+    @Bar.many_to_one :foo, :key=>:obj_id, :key_column=>Sequel.subscript(:object_ids, 0), :primary_key=>Sequel.subscript(:object_ids, 0), :primary_key_method=>:obj_id, :class=>@Foo
+    @Foo.many_to_many :mtmbars, :join_table=>:bars_foos, :left_primary_key=>:obj_id, :left_primary_key_column=>Sequel.subscript(:object_ids, 0), :right_primary_key=>Sequel.subscript(:object_ids, 0), :right_primary_key_method=>:obj_id, :left_key=>Sequel.subscript(:foo_ids, 0), :right_key=>Sequel.subscript(:bar_ids, 0), :class=>@Bar
+    @Bar.many_to_many :mtmfoos, :join_table=>:bars_foos, :left_primary_key=>:obj_id, :left_primary_key_column=>Sequel.subscript(:object_ids, 0), :right_primary_key=>Sequel.subscript(:object_ids, 0), :right_primary_key_method=>:obj_id, :left_key=>Sequel.subscript(:bar_ids, 0), :right_key=>Sequel.subscript(:foo_ids, 0), :class=>@Foo
+    @foo = @Foo.load(:id=>1, :object_ids=>[2])
+    @bar = @Bar.load(:id=>1, :object_ids=>[2])
+    @db.sqls
+  end
+
+  it "should have working regular association methods" do
+    @Bar.first.foo.should == @foo
+    @db.sqls.should == ["SELECT * FROM bars LIMIT 1", "SELECT * FROM foos WHERE (foos.object_ids[0] = 2) LIMIT 1"]
+    @Foo.first.bars.should == [@bar]
+    @db.sqls.should == ["SELECT * FROM foos LIMIT 1", "SELECT * FROM bars WHERE (bars.object_ids[0] = 2)"]
+    @Foo.first.bar.should == @bar
+    @db.sqls.should == ["SELECT * FROM foos LIMIT 1", "SELECT * FROM bars WHERE (bars.object_ids[0] = 2) LIMIT 1"]
+    @Foo.first.mtmbars.should == [@bar]
+    @db.sqls.should == ["SELECT * FROM foos LIMIT 1", "SELECT bars.* FROM bars INNER JOIN bars_foos ON ((bars_foos.bar_ids[0] = bars.object_ids[0]) AND (bars_foos.foo_ids[0] = 2))"]
+    @Bar.first.mtmfoos.should == [@foo]
+    @db.sqls.should == ["SELECT * FROM bars LIMIT 1", "SELECT foos.* FROM foos INNER JOIN bars_foos ON ((bars_foos.foo_ids[0] = foos.object_ids[0]) AND (bars_foos.bar_ids[0] = 2))"]
+  end
+
+  it "should have working eager loading methods" do
+    @Bar.eager(:foo).all.map{|o| [o, o.foo]}.should == [[@bar, @foo]]
+    @db.sqls.should == ["SELECT * FROM bars", "SELECT * FROM foos WHERE (foos.object_ids[0] IN (2))"]
+    @Foo.eager(:bars).all.map{|o| [o, o.bars]}.should == [[@foo, [@bar]]]
+    @db.sqls.should == ["SELECT * FROM foos", "SELECT * FROM bars WHERE (bars.object_ids[0] IN (2))"]
+    @Foo.eager(:bar).all.map{|o| [o, o.bar]}.should == [[@foo, @bar]]
+    @db.sqls.should == ["SELECT * FROM foos", "SELECT * FROM bars WHERE (bars.object_ids[0] IN (2))"]
+    @db.fetch = [[{:id=>1, :object_ids=>[2]}], [{:id=>1, :object_ids=>[2], :x_foreign_key_x=>2}]]
+    @Foo.eager(:mtmbars).all.map{|o| [o, o.mtmbars]}.should == [[@foo, [@bar]]]
+    @db.sqls.should == ["SELECT * FROM foos", "SELECT bars.*, bars_foos.foo_ids[0] AS x_foreign_key_x FROM bars INNER JOIN bars_foos ON ((bars_foos.bar_ids[0] = bars.object_ids[0]) AND (bars_foos.foo_ids[0] IN (2)))"]
+    @db.fetch = [[{:id=>1, :object_ids=>[2]}], [{:id=>1, :object_ids=>[2], :x_foreign_key_x=>2}]]
+    @Bar.eager(:mtmfoos).all.map{|o| [o, o.mtmfoos]}.should == [[@bar, [@foo]]]
+    @db.sqls.should == ["SELECT * FROM bars", "SELECT foos.*, bars_foos.bar_ids[0] AS x_foreign_key_x FROM foos INNER JOIN bars_foos ON ((bars_foos.foo_ids[0] = foos.object_ids[0]) AND (bars_foos.bar_ids[0] IN (2)))"]
+  end
+
+  it "should have working eager graphing methods" do
+    @db.fetch = {:id=>1, :object_ids=>[2], :foo_id=>1, :foo_object_ids=>[2]}
+    @Bar.eager_graph(:foo).all.map{|o| [o, o.foo]}.should == [[@bar, @foo]]
+    @db.sqls.should == ["SELECT bars.id, bars.object_ids, foo.id AS foo_id, foo.object_ids AS foo_object_ids FROM bars LEFT OUTER JOIN foos AS foo ON (foo.object_ids[0] = bars.object_ids[0])"]
+    @db.fetch = {:id=>1, :object_ids=>[2], :bars_id=>1, :bars_object_ids=>[2]}
+    @Foo.eager_graph(:bars).all.map{|o| [o, o.bars]}.should == [[@foo, [@bar]]]
+    @db.sqls.should == ["SELECT foos.id, foos.object_ids, bars.id AS bars_id, bars.object_ids AS bars_object_ids FROM foos LEFT OUTER JOIN bars ON (bars.object_ids[0] = foos.object_ids[0])"]
+    @db.fetch = {:id=>1, :object_ids=>[2], :bar_id=>1, :bar_object_ids=>[2]}
+    @Foo.eager_graph(:bar).all.map{|o| [o, o.bar]}.should == [[@foo, @bar]]
+    @db.sqls.should == ["SELECT foos.id, foos.object_ids, bar.id AS bar_id, bar.object_ids AS bar_object_ids FROM foos LEFT OUTER JOIN bars AS bar ON (bar.object_ids[0] = foos.object_ids[0])"]
+    @db.fetch = {:id=>1, :object_ids=>[2], :mtmfoos_id=>1, :mtmfoos_object_ids=>[2]}
+    @Bar.eager_graph(:mtmfoos).all.map{|o| [o, o.mtmfoos]}.should == [[@bar, [@foo]]]
+    @db.sqls.should == ["SELECT bars.id, bars.object_ids, mtmfoos.id AS mtmfoos_id, mtmfoos.object_ids AS mtmfoos_object_ids FROM bars LEFT OUTER JOIN bars_foos ON (bars_foos.bar_ids[0] = bars.object_ids[0]) LEFT OUTER JOIN foos AS mtmfoos ON (mtmfoos.object_ids[0] = bars_foos.foo_ids[0])"]
+    @db.fetch = {:id=>1, :object_ids=>[2], :mtmbars_id=>1, :mtmbars_object_ids=>[2]}
+    @Foo.eager_graph(:mtmbars).all.map{|o| [o, o.mtmbars]}.should == [[@foo, [@bar]]]
+    @db.sqls.should == ["SELECT foos.id, foos.object_ids, mtmbars.id AS mtmbars_id, mtmbars.object_ids AS mtmbars_object_ids FROM foos LEFT OUTER JOIN bars_foos ON (bars_foos.foo_ids[0] = foos.object_ids[0]) LEFT OUTER JOIN bars AS mtmbars ON (mtmbars.object_ids[0] = bars_foos.bar_ids[0])"]
+  end
+
+  it "should have working filter by associations with model instances" do
+    @Bar.first(:foo=>@foo).should == @bar
+    @db.sqls.should == ["SELECT * FROM bars WHERE (bars.object_ids[0] = 2) LIMIT 1"]
+    @Foo.first(:bars=>@bar).should == @foo
+    @db.sqls.should == ["SELECT * FROM foos WHERE (foos.object_ids[0] = 2) LIMIT 1"]
+    @Foo.first(:bar=>@bar).should == @foo
+    @db.sqls.should == ["SELECT * FROM foos WHERE (foos.object_ids[0] = 2) LIMIT 1"]
+    @Foo.first(:mtmbars=>@bar).should == @foo
+    @db.sqls.should == ["SELECT * FROM foos WHERE (foos.object_ids[0] IN (SELECT bars_foos.foo_ids[0] FROM bars_foos WHERE ((bars_foos.bar_ids[0] = 2) AND (bars_foos.foo_ids[0] IS NOT NULL)))) LIMIT 1"]
+    @Bar.first(:mtmfoos=>@foo).should == @bar
+    @db.sqls.should == ["SELECT * FROM bars WHERE (bars.object_ids[0] IN (SELECT bars_foos.bar_ids[0] FROM bars_foos WHERE ((bars_foos.foo_ids[0] = 2) AND (bars_foos.bar_ids[0] IS NOT NULL)))) LIMIT 1"]
+  end
+
+  it "should have working filter by associations with model datasets" do
+    @Bar.first(:foo=>@Foo.where(:id=>@foo.id)).should == @bar
+    @db.sqls.should == ["SELECT * FROM bars WHERE (bars.object_ids[0] IN (SELECT foos.object_ids[0] FROM foos WHERE ((id = 1) AND (foos.object_ids[0] IS NOT NULL)))) LIMIT 1"]
+    @Foo.first(:bars=>@Bar.where(:id=>@bar.id)).should == @foo
+    @db.sqls.should == ["SELECT * FROM foos WHERE (foos.object_ids[0] IN (SELECT bars.object_ids[0] FROM bars WHERE ((id = 1) AND (bars.object_ids[0] IS NOT NULL)))) LIMIT 1"]
+    @Foo.first(:bar=>@Bar.where(:id=>@bar.id)).should == @foo
+    @db.sqls.should == ["SELECT * FROM foos WHERE (foos.object_ids[0] IN (SELECT bars.object_ids[0] FROM bars WHERE ((id = 1) AND (bars.object_ids[0] IS NOT NULL)))) LIMIT 1"]
+    @Foo.first(:mtmbars=>@Bar.where(:id=>@bar.id)).should == @foo
+    @db.sqls.should == ["SELECT * FROM foos WHERE (foos.object_ids[0] IN (SELECT bars_foos.foo_ids[0] FROM bars_foos WHERE ((bars_foos.bar_ids[0] IN (SELECT bars.object_ids[0] FROM bars WHERE ((id = 1) AND (bars.object_ids[0] IS NOT NULL)))) AND (bars_foos.foo_ids[0] IS NOT NULL)))) LIMIT 1"]
+    @Bar.first(:mtmfoos=>@Foo.where(:id=>@foo.id)).should == @bar
+    @db.sqls.should == ["SELECT * FROM bars WHERE (bars.object_ids[0] IN (SELECT bars_foos.bar_ids[0] FROM bars_foos WHERE ((bars_foos.foo_ids[0] IN (SELECT foos.object_ids[0] FROM foos WHERE ((id = 1) AND (foos.object_ids[0] IS NOT NULL)))) AND (bars_foos.bar_ids[0] IS NOT NULL)))) LIMIT 1"]
+  end
+end
+
+describe "Model#pk_or_nil" do
+  before do
+    @m = Class.new(Sequel::Model)
+    @m.columns :id, :x, :y
+  end
+  
+  it "should be default return the value of the :id column" do
+    m = @m.load(:id => 111, :x => 2, :y => 3)
+    m.pk_or_nil.should == 111
+  end
+
+  it "should be return the primary key value for custom primary key" do
+    @m.set_primary_key :x
+    m = @m.load(:id => 111, :x => 2, :y => 3)
+    m.pk_or_nil.should == 2
+  end
+
+  it "should be return the primary key value for composite primary key" do
+    @m.set_primary_key [:y, :x]
+    m = @m.load(:id => 111, :x => 2, :y => 3)
+    m.pk_or_nil.should == [3, 2]
+  end
+
+  it "should raise if no primary key" do
+    @m.set_primary_key nil
+    m = @m.new(:id => 111, :x => 2, :y => 3)
+    m.pk_or_nil.should be_nil
+
+    @m.no_primary_key
+    m = @m.new(:id => 111, :x => 2, :y => 3)
+    m.pk_or_nil.should be_nil
+  end
+end
+
+describe Sequel::Model, "#refresh" do
+  before do
+    @c = Class.new(Sequel::Model(:items)) do
+      unrestrict_primary_key
+      columns :id, :x
+    end
+    MODEL_DB.reset
+  end
+
+  specify "should remove cached associations" do
+    @c.many_to_one :node, :class=>@c
+    @m = @c.new(:id => 555)
+    @m.associations[:node] = 15
+    @m.reload
+    @m.associations.should == {}
+  end
+end
+
+describe "Model#freeze" do
+  before do
+    class ::Album < Sequel::Model
+      columns :id
+      class B < Sequel::Model
+        columns :id, :album_id
+        many_to_one :album, :class=>Album
+      end
+      one_to_one :b, :key=>:album_id, :class=>B
+    end
+    @o = Album.load(:id=>1).freeze
+    MODEL_DB.sqls
+  end
+  after do
+    Object.send(:remove_const, :Album)
+  end
+
+  it "should freeze the object's associations" do
+    @o.associations.frozen?.should be_true
+  end
+
+  it "should not break associations getters" do
+    Album::B.dataset._fetch = {:album_id=>1, :id=>2}
+    @o.b.should == Album::B.load(:id=>2, :album_id=>1)
+    @o.associations[:b].should be_nil
+  end
+
+  it "should not break reciprocal associations" do
+    b = Album::B.load(:id=>2, :album_id=>nil)
+    b.album = @o
+    @o.associations[:b].should be_nil
   end
 end

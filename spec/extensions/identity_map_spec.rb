@@ -55,8 +55,17 @@ describe "Sequel::Plugins::IdentityMap" do
     @c.identity_map_key(1).should_not == @c.identity_map_key(2)
   end
 
-  it "#identity_map_key should be different if the pk is nil" do
-    @c.identity_map_key(nil).should_not == @c.identity_map_key(nil)
+  it "#identity_map_key should be nil for an empty pk values" do
+    @c.identity_map_key(nil).should == nil
+    @c.identity_map_key([]).should == nil
+    @c.identity_map_key([nil]).should == nil
+  end
+
+  it "#load should work even if model doesn't have a primary key" do
+    c = Class.new(@c)
+    c.no_primary_key
+    proc{c.with_identity_map{c.load({})}}.should_not raise_error
+    c.with_identity_map{c.load({}).should_not equal(c.load({}))}
   end
 
   it "#load should return an object if there is no current identity map" do
@@ -214,6 +223,23 @@ describe "Sequel::Plugins::IdentityMap" do
       MODEL_DB.sqls.length.should == 1
       o = @c1.load(:id=>2, :artist_id=>2)
       o.artist.should == a
+      MODEL_DB.sqls.length.should == 1
+    end
+  end
+
+  it "should not use the identity map as a lookup cache if a dynamic callback is used" do
+    @c1.many_to_one :artist, :class=>@c2
+    @c.with_identity_map do
+      MODEL_DB.sqls.length.should == 0
+      o = @c1.load(:id=>1, :artist_id=>2)
+      a = o.artist
+      a.should be_a_kind_of(@c2)
+      MODEL_DB.sqls.length.should == 1
+      o = @c1.load(:id=>2, :artist_id=>2)
+      o.artist.should == a
+      MODEL_DB.sqls.length.should == 0
+      o = @c1.load(:id=>3, :artist_id=>3)
+      o.artist.should_not == a
       MODEL_DB.sqls.length.should == 1
     end
   end

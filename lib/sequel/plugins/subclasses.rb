@@ -15,20 +15,34 @@ module Sequel
     #   sc2.subclasses  # []
     #   ssc1.subclasses # []
     #   c.descendents   # [sc1, ssc1, sc2]
+    #
+    # You can provide a block when loading the plugin, and it will be called
+    # with each subclass created:
+    #
+    #   a = []
+    #   Sequel::Model.plugin(:subclasses){|sc| a << sc}
+    #   class A < Sequel::Model; end
+    #   class B < Sequel::Model; end
+    #   a # => [A, B]
     module Subclasses
       # Initialize the subclasses instance variable for the model.
-      def self.apply(model)
+      def self.apply(model, &block)
         model.instance_variable_set(:@subclasses, [])
+        model.instance_variable_set(:@on_subclass, block)
       end
 
       module ClassMethods
+        # Callable object that should be called with every descendent
+        # class created.
+        attr_reader :on_subclass
+
         # All subclasses for the current model.  Does not
         # include the model itself.
         attr_reader :subclasses
 
         # All descendent classes of this model.
         def descendents
-          subclasses.map{|x| [x] + x.descendents}.flatten
+          Sequel.synchronize{_descendents}
         end
 
         # Add the subclass to this model's current subclasses,
@@ -36,8 +50,20 @@ module Sequel
         # in the subclass.
         def inherited(subclass)
           super
-          subclasses << subclass
+          Sequel.synchronize{subclasses << subclass}
           subclass.instance_variable_set(:@subclasses, [])
+          if on_subclass
+            subclass.instance_variable_set(:@on_subclass, on_subclass)
+            on_subclass.call(subclass)
+          end
+        end
+
+        private
+
+        # Recursive, non-thread safe version of descendents, since
+        # the mutex Sequel uses isn't reentrant.
+        def _descendents
+          subclasses.map{|x| [x] + x.send(:_descendents)}.flatten
         end
       end
     end

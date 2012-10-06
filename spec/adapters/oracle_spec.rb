@@ -5,30 +5,57 @@ unless defined?(ORACLE_DB)
 end
 INTEGRATION_DB = ORACLE_DB unless defined?(INTEGRATION_DB)
 
-ORACLE_DB.create_table!(:items) do
-  String :name, :size => 50
-  Integer :value
-  Date :date_created
-  index :value
-end
-
-ORACLE_DB.create_table!(:books) do
-  Integer :id
-  String :title, :size => 50
-  Integer :category_id
-end
-
-ORACLE_DB.create_table!(:categories) do
-  Integer :id
-  String :cat_name, :size => 50
-end
-
 describe "An Oracle database" do
+  before(:all) do
+    ORACLE_DB.create_table!(:items) do
+      String :name, :size => 50
+      Integer :value
+      Date :date_created
+      index :value
+    end
+
+    ORACLE_DB.create_table!(:books) do
+      Integer :id
+      String :title, :size => 50
+      Integer :category_id
+    end
+
+    ORACLE_DB.create_table!(:categories) do
+      Integer :id
+      String :cat_name, :size => 50
+    end
+    @d = ORACLE_DB[:items]
+  end
+  after do
+    @d.delete
+  end
+  after(:all) do
+    ORACLE_DB.drop_table?(:items, :books, :categories)
+  end
+
   specify "should provide disconnect functionality" do
     ORACLE_DB.execute("select user from dual")
     ORACLE_DB.pool.size.should == 1
     ORACLE_DB.disconnect
     ORACLE_DB.pool.size.should == 0
+  end
+
+  specify "should have working view_exists?" do
+    begin
+      ORACLE_DB.view_exists?(:cats).should be_false
+      ORACLE_DB.create_view(:cats, ORACLE_DB[:categories])
+      ORACLE_DB.view_exists?(:cats).should be_true
+      om = ORACLE_DB.identifier_output_method
+      im = ORACLE_DB.identifier_input_method
+      ORACLE_DB.identifier_output_method = :reverse
+      ORACLE_DB.identifier_input_method = :reverse
+      ORACLE_DB.view_exists?(:STAC).should be_true
+      ORACLE_DB.view_exists?(:cats).should be_false
+    ensure
+      ORACLE_DB.identifier_output_method = om
+      ORACLE_DB.identifier_input_method = im
+      ORACLE_DB.drop_view(:cats)
+    end
   end
 
   specify "should be able to get current sequence value with SQL" do
@@ -63,15 +90,9 @@ describe "An Oracle database" do
       primary_key :id, :integer, :null => false
       index :name, :unique => true
     end
+    ORACLE_DB.drop_table?(:test_tmp)
   end
-end
 
-describe "An Oracle dataset" do
-  before do
-    @d = ORACLE_DB[:items]
-    @d.delete # remove all records
-  end
-  
   specify "should return the correct record count" do
     @d.count.should == 0
     @d << {:name => 'abc', :value => 123}
@@ -97,7 +118,7 @@ describe "An Oracle dataset" do
       {:name => 'def'}
     ]
            
-    @d.order(:value.desc).limit(1).to_a.should == [
+    @d.order(Sequel.desc(:value)).limit(1).to_a.should == [
       {:date_created=>nil, :name => 'def', :value => 789}                                        
     ]
 
@@ -106,7 +127,7 @@ describe "An Oracle dataset" do
       {:date_created=>nil, :name => 'abc', :value => 456} 
     ]
     
-    @d.order(:value.desc).filter(:name => 'abc').to_a.should == [
+    @d.order(Sequel.desc(:value)).filter(:name => 'abc').to_a.should == [
       {:date_created=>nil, :name => 'abc', :value => 456},
       {:date_created=>nil, :name => 'abc', :value => 123} 
     ]
@@ -115,7 +136,7 @@ describe "An Oracle dataset" do
       {:date_created=>nil, :name => 'abc', :value => 123}                                        
     ]
         
-    @d.filter(:name => 'abc').order(:value.desc).limit(1).to_a.should == [
+    @d.filter(:name => 'abc').order(Sequel.desc(:value)).limit(1).to_a.should == [
       {:date_created=>nil, :name => 'abc', :value => 456}                                        
     ]
     
@@ -139,25 +160,25 @@ describe "An Oracle dataset" do
     
     @d.max(:value).to_i.should == 789
     
-    @d.select(:name, :AVG.sql_function(:value).as(:avg)).filter(:name => 'abc').group(:name).to_a.should == [
+    @d.select(:name, Sequel.function(:AVG, :value).as(:avg)).filter(:name => 'abc').group(:name).to_a.should == [
       {:name => 'abc', :avg => (456+123)/2.0}
     ]
 
-    @d.select(:AVG.sql_function(:value).as(:avg)).group(:name).order(:name).limit(1).to_a.should == [
+    @d.select(Sequel.function(:AVG, :value).as(:avg)).group(:name).order(:name).limit(1).to_a.should == [
       {:avg => (456+123)/2.0}
     ]
         
-    @d.select(:name, :AVG.sql_function(:value).as(:avg)).group(:name).order(:name).to_a.should == [
+    @d.select(:name, Sequel.function(:AVG, :value).as(:avg)).group(:name).order(:name).to_a.should == [
       {:name => 'abc', :avg => (456+123)/2.0},
       {:name => 'def', :avg => 789*1.0}
     ]
     
-    @d.select(:name, :AVG.sql_function(:value).as(:avg)).group(:name).order(:name).to_a.should == [
+    @d.select(:name, Sequel.function(:AVG, :value).as(:avg)).group(:name).order(:name).to_a.should == [
       {:name => 'abc', :avg => (456+123)/2.0},
       {:name => 'def', :avg => 789*1.0}
     ]
 
-    @d.select(:name, :AVG.sql_function(:value).as(:avg)).group(:name).having(:name => ['abc', 'def']).order(:name).to_a.should == [
+    @d.select(:name, Sequel.function(:AVG, :value).as(:avg)).group(:name).having(:name => ['abc', 'def']).order(:name).to_a.should == [
       {:name => 'abc', :avg => (456+123)/2.0},
       {:name => 'def', :avg => 789*1.0}
     ]
@@ -176,8 +197,6 @@ describe "An Oracle dataset" do
     @d << {:name => 'def', :value => 789}
     @d.filter(:name => 'abc').update(:value => 530)
     
-    # the third record should stay the same
-    # floating-point precision bullshit
     @d[:name => 'def'][:value].should == 789
     @d.filter(:value => 530).count.should == 2
   end
@@ -185,7 +204,7 @@ describe "An Oracle dataset" do
   specify "should translate values correctly" do
     @d << {:name => 'abc', :value => 456}
     @d << {:name => 'def', :value => 789}
-    @d.filter('value > 500').update(:date_created => "to_timestamp('2009-09-09', 'YYYY-MM-DD')".lit)
+    @d.filter('value > 500').update(:date_created => Sequel.lit("to_timestamp('2009-09-09', 'YYYY-MM-DD')"))
     
     @d[:name => 'def'][:date_created].strftime('%F').should == '2009-09-09'
   end
@@ -212,24 +231,20 @@ describe "An Oracle dataset" do
 
     @d.count.should == 1
   end
-end
 
-describe "Joined Oracle dataset" do
-  before do
+  specify "should return correct result" do
     @d1 = ORACLE_DB[:books]
-    @d1.delete # remove all records
+    @d1.delete
     @d1 << {:id => 1, :title => 'aaa', :category_id => 100}
     @d1 << {:id => 2, :title => 'bbb', :category_id => 100}
     @d1 << {:id => 3, :title => 'ccc', :category_id => 101}
     @d1 << {:id => 4, :title => 'ddd', :category_id => 102}
     
     @d2 = ORACLE_DB[:categories]
-    @d2.delete # remove all records
+    @d2.delete
     @d2 << {:id => 100, :cat_name => 'ruby'}
     @d2 << {:id => 101, :cat_name => 'rails'}
-  end
   
-  specify "should return correct result" do
     @d1.join(:categories, :id => :category_id).select(:books__id, :title, :cat_name).order(:books__id).to_a.should == [
       {:id => 1, :title => 'aaa', :cat_name => 'ruby'},
       {:id => 2, :title => 'bbb', :cat_name => 'ruby'},
@@ -248,24 +263,20 @@ describe "Joined Oracle dataset" do
       {:id => 4, :title => 'ddd', :cat_name => nil} 
     ]
     
-    @d1.left_outer_join(:categories, :id => :category_id).select(:books__id, :title, :cat_name).order(:books__id.desc).limit(2, 0).to_a.should == [      
+    @d1.left_outer_join(:categories, :id => :category_id).select(:books__id, :title, :cat_name).reverse_order(:books__id).limit(2, 0).to_a.should == [      
       {:id => 4, :title => 'ddd', :cat_name => nil}, 
       {:id => 3, :title => 'ccc', :cat_name => 'rails'}
     ]      
   end  
-end
 
-describe "Oracle aliasing" do
-  before do
+  specify "should allow columns to be renamed" do
     @d1 = ORACLE_DB[:books]
-    @d1.delete # remove all records
+    @d1.delete
     @d1 << {:id => 1, :title => 'aaa', :category_id => 100}
     @d1 << {:id => 2, :title => 'bbb', :category_id => 100}
     @d1 << {:id => 3, :title => 'bbb', :category_id => 100}
-  end
 
-  specify "should allow columns to be renamed" do
-    @d1.select(:title.as(:name)).order_by(:id).to_a.should == [
+    @d1.select(Sequel.as(:title, :name)).order_by(:id).to_a.should == [
       { :name => 'aaa' },
       { :name => 'bbb' },
       { :name => 'bbb' },
@@ -273,22 +284,14 @@ describe "Oracle aliasing" do
   end
 
   specify "nested queries should work" do
-    @d1.select(:title).group_by(:title).count.should == 2
-  end
-end
-
-describe "Row locks in Oracle" do
-  before do
-    @d1 = ORACLE_DB[:books]
-    @d1.delete
-    @d1 << {:id => 1, :title => 'aaa'}
+    ORACLE_DB[:books].select(:title).group_by(:title).count.should == 2
   end
 
   specify "#for_update should use FOR UPDATE" do
-    @d1.for_update.sql.should == 'SELECT * FROM "BOOKS" FOR UPDATE'
+    ORACLE_DB[:books].for_update.sql.should == 'SELECT * FROM "BOOKS" FOR UPDATE'
   end
 
   specify "#lock_style should accept symbols" do
-    @d1.lock_style(:update).sql.should == 'SELECT * FROM "BOOKS" FOR UPDATE'
+    ORACLE_DB[:books].lock_style(:update).sql.should == 'SELECT * FROM "BOOKS" FOR UPDATE'
   end
 end

@@ -48,7 +48,7 @@ unless the first argument is a hash. So the following statements are equivalent 
 
 Note that using an adapter method forces the use of the specified adapter, not a database type, even
 though some adapters have the same name as the database type.  So if you
-want to connect to SQLite, for example, you can do so using the sqlite, do, dbi, jdbc, odbc, and swift adapters.
+want to connect to SQLite, for example, you can do so using the sqlite, do, jdbc, and swift adapters.
 If you want to connect to SQLite on JRuby using the jdbc adapter, you should not use <tt>Sequel.sqlite</tt>
 for example, as that uses the C-based sqlite3 gem. Instead, the <tt>Sequel.jdbc</tt> would be appropriate (though
 as mentioned below, using <tt>Sequel.connect</tt> is recommended instead of <tt>Sequel.jdbc</tt>). 
@@ -68,7 +68,7 @@ These options are shared by all adapters unless otherwise noted.
 
 :adapter :: The adapter to use
 :database :: The name of the database to which to connect
-:default_schema :: The database schema to use by default.
+:default_schema :: The database schema to use in schema_modification and introspection.
 :host :: The hostname of the database server to which to connect
 :logger :: An array of SQL loggers to log to
 :loggers :: An array of SQL loggers to log to
@@ -148,6 +148,12 @@ Without a database argument, assumes a memory database, so you can do:
 Handles paths in the connection string similar to the SQLite adapter, so see
 the sqlite section below for details.
 
+=== cubrid
+
+cubrid is a ruby extension for accessing a CUBRID database.  Currently,
+the ruby cubrid gem is in fairly rough state, with broken transaction
+support and some other issues, but most things work.
+
 === db2 
 
 Requires: db2/db2cli
@@ -192,7 +198,7 @@ be faster than the other adapters.
 Similar to the JDBC adapter, the DO adapter only cares about connection strings,
 which can either be the String argument given to Sequel.connect directly or contained
 in a :uri or :url option.  The DO adapter passes through the connection string
-directly to DataObjects, it does no processing of it.
+directly to DataObjects, it does no processing of it (other than removing the do: prefix).
 
 Connection string examples:
 
@@ -232,9 +238,9 @@ Requires: java
 
 Houses Sequel's JDBC support when running on JRuby.
 Support for individual database types is done using sub adapters.
-There are currently subadapters for PostgreSQL, MySQL, SQLite, H2,
-Oracle, MSSQL, JTDS, AS400, and DB2.  All except Oracle, MSSQL, AS400, and DB2 can load the
-jdbc-* gem, for those you need to have the .jar in your CLASSPATH
+There are currently subadapters for PostgreSQL, MySQL, SQLite, H2, HSQLDB, Derby,
+Oracle, MSSQL, JTDS, AS400, Progress, Firebird, Informix, and DB2.  For PostgreSQL, MySQL, SQLite, H2, Derby,
+and JTDS, this can use the jdbc-* gem, for the others you need to have the .jar in your CLASSPATH
 or load the Java class manually before calling Sequel.connect.
 
 You just use the JDBC connection string directly, which can be specified
@@ -265,6 +271,8 @@ Example connection strings:
   jdbc:oracle:thin:user/password@localhost:1521:database
   jdbc:db2://localhost:3700/database:user=user;password=password;
   jdbc:firebirdsql:localhost/3050:/path/to/database.fdb
+  jdbc:jdbcprogress:T:hostname:port:database
+  jdbc:cubrid:hostname:port:database:::
 
 You can also use JNDI connection strings:
 
@@ -294,6 +302,8 @@ The following additional options are supported:
 :config_local_infile :: If provided, sets the Mysql::OPT_LOCAL_INFILE option on the connection with the given value.
 :encoding :: Specify the encoding/character set to use for the connection.
 :socket :: Can be used to specify a Unix socket file to connect to instead of a TCP host and port.
+:sql_mode :: Set the sql_mode(s) for a given connection.  Can be single symbol or string,
+             or an array of symbols or strings (e.g. <tt>:sql_mode=>[:no_zero_date, :pipes_as_concat]</tt>).
 :timeout :: Sets the wait_timeout for the connection, defaults to 1 month.
 :read_timeout :: Set the timeout in seconds for reading back results to a query.
 :connect_timeout :: Set the timeout in seconds before a connection attempt is abandoned.
@@ -338,6 +348,9 @@ Requires: pg (or postgres if pg is not available)
 
 The Sequel postgres adapter works with the pg, postgres, and postgres-pr ruby libraries.
 The pg library is the best supported, as it supports real bound variables and prepared statements.
+If the pg library is being used, Sequel will also attempt to load the sequel_pg library, which is
+a C extension that optimizes performance when Sequel is used with pg.  All users of Sequel who
+use pg are encouraged to install sequel_pg.
 
 The following additional options are supported:
 
@@ -345,6 +358,8 @@ The following additional options are supported:
 :encoding :: Set the client_encoding to the given string
 :connect_timeout :: Set the number of seconds to wait for a connection (default 20, only respected
                     if using the pg library).
+:sslmode :: Set to 'disable', 'allow', 'prefer', 'require' to choose how to treat SSL (only
+            respected if using the pg library)
 
 === sqlite
 
@@ -379,6 +394,12 @@ swift is a ruby 1.9 only library, so you'll need to be running ruby 1.9.  It
 can connect to SQLite, MySQL, and PostgreSQL, and you must specify which
 database using the db_type option.
 
+You need to install one of the swift db adapters
+
+* swift-db-sqlite3
+* swift-db-mysql
+* swift-db-postgres
+
 Examples:
 
   swift:///?database=:memory:&db_type=sqlite
@@ -396,6 +417,14 @@ the Sequel :user option.  If you want to use an entry in the freetds.conf file, 
 should specify the :dataserver option with that name as the value.  Some other
 options that you may want to set are :login_timeout, :timeout, :tds_version, :azure,
 :appname, and :encoding, see the tiny_tds README for details.
+
+Other Sequel specific options:
+
+:textsize :: Override the default TEXTSIZE setting for this connection.  The FreeTDS
+             default is small (around 64000 bytes), but can be set up to around 2GB.
+             This should be specified as an integer.  If you plan on setting large
+             text or blob values via tinytds, you should use this option or modify
+             your freetds.conf file.
 
 For highest performance, you should disable any identifier output method when
 using the tinytds adapter, which probably means disabling any identifier input method

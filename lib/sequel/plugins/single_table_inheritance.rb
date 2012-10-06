@@ -117,7 +117,7 @@ module Sequel
             @sti_dataset = sd
             @sti_key_map = skm
             @sti_model_map = smm
-            @simple_table = nil
+            self.simple_table = nil
           end
         end
 
@@ -131,7 +131,7 @@ module Sequel
         # keys for all of their descendant classes.
         def sti_subclass_added(key)
           if sti_key_array
-            sti_key_array << key
+            Sequel.synchronize{sti_key_array << key}
             superclass.sti_subclass_added(key)
           end
         end

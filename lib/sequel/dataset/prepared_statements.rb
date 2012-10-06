@@ -12,15 +12,12 @@ module Sequel
     # native database support for bind variables and prepared
     # statements (as opposed to the emulated ones used by default).
     module ArgumentMapper
-      SQL_QUERY_TYPE = Hash.new{|h,k| h[k] = k}
-      SQL_QUERY_TYPE[:first] = SQL_QUERY_TYPE[:all] = :select
-      
       # The name of the prepared statement, if any.
       attr_accessor :prepared_statement_name
       
       # The bind arguments to use for running this prepared statement
       attr_accessor :bind_arguments
-      
+
       # Set the bind arguments based on the hash and call super.
       def call(bind_vars={}, &block)
         ds = bind(bind_vars)
@@ -38,13 +35,6 @@ module Sequel
         @opts[:sql] = @prepared_sql
         @prepared_sql
       end
-      
-      private
-      
-      # The type of query (:select, :insert, :delete, :update).
-      def sql_query_type
-        SQL_QUERY_TYPE[@prepared_type]
-      end
     end
 
     # Backbone of the prepared statement support.  Grafts bind variable
@@ -55,6 +45,10 @@ module Sequel
     # from using the dataset without bind variables.
     module PreparedStatementMethods
       PLACEHOLDER_RE = /\A\$(.*)\z/
+      
+      # Whether to log the full SQL query.  By default, just the prepared statement
+      # name is generally logged on adapters that support native prepared statements.
+      attr_accessor :log_sql
       
       # The type of prepared statement, should be one of :select, :first,
       # :insert, :update, or :delete
@@ -86,7 +80,8 @@ module Sequel
       # the type of the statement and the prepared_modify_values.
       def prepared_sql
         case @prepared_type
-        when :select, :all
+        when :select, :all, :each
+          # Most common scenario, so listed first.
           select_sql
         when :first
           clone(:limit=>1).select_sql
@@ -98,6 +93,8 @@ module Sequel
           update_sql(*@prepared_modify_values)
         when :delete
           delete_sql
+        else
+          select_sql
         end
       end
       
@@ -132,7 +129,10 @@ module Sequel
       def run(&block)
         case @prepared_type
         when :select, :all
+          # Most common scenario, so listed first
           all(&block)
+        when :each
+          each(&block)
         when :insert_select
           with_sql(prepared_sql).first
         when :first
@@ -143,6 +143,13 @@ module Sequel
           update(*@prepared_modify_values)
         when :delete
           delete
+        when Array
+          case @prepared_type.at(0)
+          when :map, :to_hash, :to_hash_groups
+            send(*@prepared_type, &block) 
+          end
+        else
+          all(&block)
         end
       end
       
@@ -242,7 +249,7 @@ module Sequel
     #   DB.call(:select_by_name, :name=>'Blah') # Same thing
     def prepare(type, name=nil, *values)
       ps = to_prepared_statement(type, values)
-      db.prepared_statements[name] = ps if name
+      db.set_prepared_statement(name, ps) if name
       ps
     end
     

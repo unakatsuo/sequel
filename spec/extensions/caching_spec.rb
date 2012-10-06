@@ -82,7 +82,7 @@ describe Sequel::Model, "caching" do
     Class.new(@c).cache_ttl.should == 1234
   end
   
-  it "should generate a cache key appropriate to the class" do
+  it "should generate a cache key appropriate to the class via the Model#cache_key" do
     m = @c.new
     m.values[:id] = 1
     m.cache_key.should == "#{m.class}:1"
@@ -113,6 +113,11 @@ describe Sequel::Model, "caching" do
     m.values[:c] = 456
     m.values[:b] = 789
     m.cache_key.should == "#{m.class}:123,789,456"
+  end
+
+  it "should generate a cache key via the Model.cache_key method" do
+    @c.cache_key(1).should == "#{@c}:1"
+    @c.cache_key([1, 2]).should == "#{@c}:1,2"
   end
   
   it "should raise error if attempting to generate cache_key and primary key value is null" do
@@ -156,6 +161,11 @@ describe Sequel::Model, "caching" do
     m2.should == m
     m2.values.should == {:name=>"sharon", :id=>1}
   end
+
+  it "should handle lookups by nil primary keys" do
+    @c[nil].should == nil
+    @c.db.sqls.should == []
+  end
   
   it "should delete the cache when writing to the database" do
     m = @c[1]
@@ -178,13 +188,13 @@ describe Sequel::Model, "caching" do
     @cache[m.cache_key].should == m
     m.delete
     @cache.has_key?(m.cache_key).should be_false
-    @c.db.sqls.should == ["SELECT * FROM items WHERE id = 1", "DELETE FROM items WHERE (id = 1)"]
+    @c.db.sqls.should == ["SELECT * FROM items WHERE id = 1", "DELETE FROM items WHERE id = 1"]
 
     m = @c2[1]
     @cache[m.cache_key].should == m
     m.delete
     @cache.has_key?(m.cache_key).should be_false
-    @c.db.sqls.should == ["SELECT * FROM items WHERE id = 1", "DELETE FROM items WHERE (id = 1)"]
+    @c.db.sqls.should == ["SELECT * FROM items WHERE id = 1", "DELETE FROM items WHERE id = 1"]
   end
   
   it "should support #[] as a shortcut to #find with hash" do
@@ -219,5 +229,18 @@ describe Sequel::Model, "caching" do
   
   it "should rescue an exception if cache_store is memcached and ignore_exception is enabled" do
     @c4[1].values.should == {:name => 'sharon', :id => 1}
+  end
+  
+  it "should support Model.cache_get_pk for getting a value from the cache by primary key" do
+    @c.cache_get_pk(1).should == nil
+    m = @c[1]
+    @c.cache_get_pk(1).should == m
+  end
+  
+  it "should support Model.cache_delete_pk for removing a value from the cache by primary key" do
+    @c[1]
+    @c.cache_get_pk(1).should_not == nil
+    @c.cache_delete_pk(1).should == nil
+    @c.cache_get_pk(1).should == nil
   end
 end

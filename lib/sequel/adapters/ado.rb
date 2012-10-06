@@ -12,9 +12,9 @@ module Sequel
         super
         case @opts[:conn_string]
         when /Microsoft\.(Jet|ACE)\.OLEDB/io
-          Sequel.ts_require 'adapters/shared/access'
-          extend Sequel::Access::DatabaseMethods
-          extend_datasets(Sequel::Access::DatasetMethods)
+          Sequel.ts_require 'adapters/ado/access'
+          extend Sequel::ADO::Access::DatabaseMethods
+          @dataset_class = ADO::Access::Dataset
         else
           @opts[:driver] ||= 'SQL Server'
           case @opts[:driver]
@@ -57,6 +57,32 @@ module Sequel
         handle
       end
       
+      # Just execute so it doesn't attempt to return the number of rows modified.
+      def execute_ddl(sql, opts={})
+        execute(sql, opts)
+      end
+
+      # Just execute so it doesn't attempt to return the number of rows modified.
+      def execute_insert(sql, opts={})
+        execute(sql, opts)
+      end
+      
+      # Use pass by reference in WIN32OLE to get the number of affected rows,
+      # unless is a provider is in use (since some providers don't seem to
+      # return the number of affected rows, but the default provider appears
+      # to).
+      def execute_dui(sql, opts={})
+        return super if opts[:provider]
+        synchronize(opts[:server]) do |conn|
+          begin
+            log_yield(sql){conn.Execute(sql, 1)}
+            WIN32OLE::ARGV[1]
+          rescue ::WIN32OLERuntimeError => e
+            raise_error(e)
+          end
+        end
+      end
+
       def execute(sql, opts={})
         synchronize(opts[:server]) do |conn|
           begin

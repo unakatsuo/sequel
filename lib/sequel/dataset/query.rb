@@ -5,6 +5,11 @@ module Sequel
     # These methods all return modified copies of the receiver.
     # ---------------------
 
+    # Hash of extension name symbols to callable objects to load the extension
+    # into the Dataset object (usually by extending it with a module defined
+    # in the extension).
+    EXTENSIONS = {}
+
     # The dataset options that require the removal of cached columns
     # if changed.
     COLUMN_CHANGE_OPTS = [:select, :sql, :from, :join].freeze
@@ -36,6 +41,27 @@ module Sequel
       set_defaults set_graph_aliases set_overrides unfiltered ungraphed ungrouped union
       unlimited unordered where with with_recursive with_sql
     METHS
+
+    # Register an extension callback for Dataset objects.  ext should be the
+    # extension name symbol, and mod should either be a Module that the
+    # dataset is extended with, or a callable object called with the database
+    # object.  If mod is not provided, a block can be provided and is treated
+    # as the mod object.
+    #
+    # If mod is a module, this also registers a Database extension that will
+    # extend all of the database's datasets.
+    def self.register_extension(ext, mod=nil, &block)
+      if mod
+        raise(Error, "cannot provide both mod and block to Dataset.register_extension") if block
+        if mod.is_a?(Module)
+          block = proc{|ds| ds.extend(mod)}
+          Sequel::Database.register_extension(ext){|db| db.extend_datasets(mod)}
+        else
+          block = mod
+        end
+      end
+      Sequel.synchronize{EXTENSIONS[ext] = block}
+    end
 
     # Adds an further filter to an existing filter using AND. If no filter 
     # exists an error is raised. This method is identical to #filter except
@@ -130,6 +156,28 @@ module Sequel
       _filter_or_exclude(true, :where, *cond, &block)
     end
 
+    # Return a clone of the dataset loaded with the extensions, see #extension!.
+    def extension(*exts)
+      clone.extension!(*exts)
+    end
+
+    # Load an extension into the receiver.  In addition to requiring the extension file, this
+    # also modifies the dataset to work with the extension (usually extending it with a
+    # module defined in the extension file).  If no related extension file exists or the
+    # extension does not have specific support for Database objects, an Error will be raised.
+    # Returns self.
+    def extension!(*exts)
+      Sequel.extension(*exts)
+      exts.each do |ext|
+        if pr = Sequel.synchronize{EXTENSIONS[ext]}
+          pr.call(self)
+        else
+          raise(Error, "Extension #{ext} does not have specific support handling individual datasets")
+        end
+      end
+      self
+    end
+
     # Returns a copy of the dataset with the given conditions imposed upon it.  
     # If the query already has a HAVING clause, then the conditions are imposed in the 
     # HAVING clause. If not, then they are imposed in the WHERE clause.
@@ -164,7 +212,7 @@ module Sequel
     #   DB[:items].filter('price < ?', 100)
     #   # SELECT * FROM items WHERE price < 100
     #
-    #   DB[:items].filter([[:id, (1,2,3)], [:id, 0..10]])
+    #   DB[:items].filter([[:id, [1,2,3]], [:id, 0..10]])
     #   # SELECT * FROM items WHERE ((id IN (1, 2, 3)) AND ((id >= 0) AND (id <= 10)))
     #
     #   DB[:items].filter('price < 100')
@@ -218,7 +266,7 @@ module Sequel
         when Symbol
           sch, table, aliaz = split_symbol(s)
           if aliaz
-            s = sch ? SQL::QualifiedIdentifier.new(sch.to_sym, table.to_sym) : SQL::Identifier.new(table.to_sym)
+            s = sch ? SQL::QualifiedIdentifier.new(sch, table) : SQL::Identifier.new(table)
             sources << SQL::AliasedExpression.new(s, aliaz.to_sym)
           else
             sources << s
@@ -337,6 +385,18 @@ module Sequel
       select_group(*columns, &block).select_more(COUNT_OF_ALL_AS_COUNT)
     end
 
+    # Adds the appropriate CUBE syntax to GROUP BY.
+    def group_cube
+      raise Error, "GROUP BY CUBE not supported on #{db.database_type}" unless supports_group_cube?
+      clone(:group_options=>:cube)
+    end
+
+    # Adds the appropriate ROLLUP syntax to GROUP BY.
+    def group_rollup
+      raise Error, "GROUP BY ROLLUP not supported on #{db.database_type}" unless supports_group_rollup?
+      clone(:group_options=>:rollup)
+    end
+
     # Returns a copy of the dataset with the HAVING conditions changed. See #filter for argument types.
     #
     #   DB[:items].group(:sum).having(:sum=>10)
@@ -399,7 +459,6 @@ module Sequel
     # * type - The type of join to do (e.g. :inner)
     # * table - Depends on type:
     #   * Dataset - a subselect is performed with an alias of tN for some value of N
-    #   * Model (or anything responding to :table_name) - table.table_name
     #   * String, Symbol: table
     # * expr - specifies conditions, depends on type:
     #   * Hash, Array of two element arrays - Assumes key (1st arg) is column of joined table (unless already
@@ -420,6 +479,9 @@ module Sequel
     #     to the same table more than once.  No alias is used by default.
     #   * :implicit_qualifier - The name to use for qualifying implicit conditions.  By default,
     #     the last joined or primary table is used.
+    #   * :qualify - Can be set to false to not do any implicit qualification.  Can be set
+    #     to :deep to use the Qualifier AST Transformer, which will attempt to qualify
+    #     subexpressions of the expression tree.
     # * block - The block argument should only be given if a JOIN with an ON clause is used,
     #   in which case it yields the table alias/name for the table currently being joined,
     #   the table alias/name for the last joined (or first table), and an array of previous
@@ -437,7 +499,7 @@ module Sequel
     #   # SELECT * FROM a LEFT JOIN b AS c USING (d)
     #
     #   DB[:a].natural_join(:b).join_table(:inner, :c) do |ta, jta, js|
-    #     (:d.qualify(ta) > :e.qualify(jta)) & {:f.qualify(ta)=>DB.from(js.first.table).select(:g)}
+    #     (Sequel.qualify(ta, :d) > Sequel.qualify(jta, :e)) & {Sequel.qualify(ta, :f)=>DB.from(js.first.table).select(:g)}
     #   end
     #   # SELECT * FROM a NATURAL JOIN b INNER JOIN c
     #   #   ON ((c.d > b.e) AND (c.f IN (SELECT g FROM b)))
@@ -458,6 +520,7 @@ module Sequel
       when Hash
         table_alias = options[:table_alias]
         last_alias = options[:implicit_qualifier]
+        qualify_type = options[:qualify]
       when Symbol, String, SQL::Identifier
         table_alias = options
         last_alias = nil 
@@ -472,7 +535,6 @@ module Sequel
         end
         table_name = table_alias
       else
-        table = table.table_name if table.respond_to?(:table_name)
         table, implicit_table_alias = split_alias(table)
         table_alias ||= implicit_table_alias
         table_name = table_alias || table
@@ -487,8 +549,16 @@ module Sequel
         last_alias ||= @opts[:last_joined_table] || first_source_alias
         if Sequel.condition_specifier?(expr)
           expr = expr.collect do |k, v|
-            k = qualified_column_name(k, table_name) if k.is_a?(Symbol)
-            v = qualified_column_name(v, last_alias) if v.is_a?(Symbol)
+            case qualify_type
+            when false
+              nil # Do no qualification
+            when :deep
+              k = Sequel::Qualifier.new(self, table_name).transform(k)
+              v = Sequel::Qualifier.new(self, last_alias).transform(v)
+            else
+              k = qualified_column_name(k, table_name) if k.is_a?(Symbol)
+              v = qualified_column_name(v, last_alias) if v.is_a?(Symbol)
+            end
             [k,v]
           end
           expr = SQL::BooleanExpression.from_value_pairs(expr)
@@ -585,10 +655,10 @@ module Sequel
     #
     #   DB[:items].order(:name) # SELECT * FROM items ORDER BY name
     #   DB[:items].order(:a, :b) # SELECT * FROM items ORDER BY a, b
-    #   DB[:items].order('a + b'.lit) # SELECT * FROM items ORDER BY a + b
+    #   DB[:items].order(Sequel.lit('a + b')) # SELECT * FROM items ORDER BY a + b
     #   DB[:items].order(:a + :b) # SELECT * FROM items ORDER BY (a + b)
-    #   DB[:items].order(:name.desc) # SELECT * FROM items ORDER BY name DESC
-    #   DB[:items].order(:name.asc(:nulls=>:last)) # SELECT * FROM items ORDER BY name ASC NULLS LAST
+    #   DB[:items].order(Sequel.desc(:name)) # SELECT * FROM items ORDER BY name DESC
+    #   DB[:items].order(Sequel.asc(:name, :nulls=>:last)) # SELECT * FROM items ORDER BY name ASC NULLS LAST
     #   DB[:items].order{sum(name).desc} # SELECT * FROM items ORDER BY sum(name) DESC
     #   DB[:items].order(nil) # SELECT * FROM items
     def order(*columns, &block)
@@ -684,7 +754,7 @@ module Sequel
     #
     #   DB[:items].reverse(:id) # SELECT * FROM items ORDER BY id DESC
     #   DB[:items].order(:id).reverse # SELECT * FROM items ORDER BY id DESC
-    #   DB[:items].order(:id).reverse(:name.asc) # SELECT * FROM items ORDER BY name ASC
+    #   DB[:items].order(:id).reverse(Sequel.desc(:name)) # SELECT * FROM items ORDER BY name ASC
     def reverse(*order)
       order(*invert_order(order.empty? ? @opts[:order] : order))
     end
@@ -904,17 +974,16 @@ module Sequel
     # :args :: Specify the arguments/columns for the CTE, should be an array of symbols.
     # :union_all :: Set to false to use UNION instead of UNION ALL combining the nonrecursive and recursive parts.
     #
-    #   DB[:t].select(:i___id, :pi___parent_id).
-    #    with_recursive(:t,
-    #                   DB[:i1].filter(:parent_id=>nil),
-    #                   DB[:t].join(:t, :i=>:parent_id).select(:i1__id, :i1__parent_id),
-    #                   :args=>[:i, :pi])
-    #   # WITH RECURSIVE t(i, pi) AS (
-    #   #   SELECT * FROM i1 WHERE (parent_id IS NULL)
+    #   DB[:t].with_recursive(:t,
+    #     DB[:i1].select(:id, :parent_id).filter(:parent_id=>nil),
+    #     DB[:i1].join(:t, :id=>:parent_id).select(:i1__id, :i1__parent_id),
+    #     :args=>[:id, :parent_id])
+    #   
+    #   # WITH RECURSIVE "t"("id", "parent_id") AS (
+    #   #   SELECT "id", "parent_id" FROM "i1" WHERE ("parent_id" IS NULL)
     #   #   UNION ALL
-    #   #   SELECT i1.id, i1.parent_id FROM t INNER JOIN t ON (t.i = t.parent_id)
-    #   # )
-    #   # SELECT i AS id, pi AS parent_id FROM t
+    #   #   SELECT "i1"."id", "i1"."parent_id" FROM "i1" INNER JOIN "t" ON ("t"."id" = "i1"."parent_id")
+    #   # ) SELECT * FROM "t"
     def with_recursive(name, nonrecursive, recursive, opts={})
       raise(Error, 'This datatset does not support common table expressions') unless supports_cte?
       if hoist_cte?(nonrecursive)
@@ -1047,8 +1116,8 @@ module Sequel
     # Inverts the given order by breaking it into a list of column references
     # and inverting them.
     #
-    #   DB[:items].invert_order([:id.desc]]) #=> [:id]
-    #   DB[:items].invert_order(:category, :price.desc]) #=> [:category.desc, :price]
+    #   DB[:items].invert_order([Sequel.desc(:id)]]) #=> [Sequel.asc(:id)]
+    #   DB[:items].invert_order([:category, Sequel.desc(:price)]) #=> [Sequel.desc(:category), Sequel.asc(:price)]
     def invert_order(order)
       return nil unless order
       new_order = []

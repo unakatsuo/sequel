@@ -6,6 +6,8 @@ module Sequel
     module HSQLDB
       # Instance methods for HSQLDB Database objects accessed via JDBC.
       module DatabaseMethods
+        PRIMARY_KEY_INDEX_RE = /\Asys_idx_sys_pk_/i.freeze
+
         include ::Sequel::JDBC::Transactions
 
         # HSQLDB uses the :hsqldb database type.
@@ -45,6 +47,11 @@ module Sequel
           end
         end
 
+        # HSQLDB requires parens around the SELECT, and the WITH DATA syntax.
+        def create_table_as_sql(name, sql, options)
+          "#{create_table_prefix_sql(name, options)} AS (#{sql}) WITH DATA"
+        end
+
         # Use IDENTITY() to get the last inserted id.
         def last_insert_id(conn, opts={})
           statement(conn) do |stmt|
@@ -53,6 +60,11 @@ module Sequel
             rs.next
             rs.getInt(1)
           end
+        end
+        
+        # Primary key indexes appear to start with sys_idx_sys_pk_ on HSQLDB
+        def primary_key_index_re
+          PRIMARY_KEY_INDEX_RE
         end
 
         # If an :identity option is present in the column, add the necessary IDENTITY SQL.
@@ -70,6 +82,11 @@ module Sequel
           else
             super
           end
+        end
+
+        # HSQLDB uses clob for text types.
+        def uses_clob_for_text?
+          true
         end
       end
       
@@ -105,6 +122,8 @@ module Sequel
             sql << complex_expression_arg_pairs(args){|a, b| "(#{literal(a)} * POWER(2, #{literal(b)}))"}
           when :>>
             sql << complex_expression_arg_pairs(args){|a, b| "(#{literal(a)} / POWER(2, #{literal(b)}))"}
+          when :%
+            sql << complex_expression_arg_pairs(args){|a, b| "MOD(#{literal(a)}, #{literal(b)})"}
           when :'B~'
             sql << BITCOMP_OPEN
             literal_append(sql, args.at(0))

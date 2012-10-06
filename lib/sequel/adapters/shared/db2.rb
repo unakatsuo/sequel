@@ -60,9 +60,16 @@ module Sequel
 
       # Use SYSCAT.INDEXES to get the indexes for the table
       def indexes(table, opts = {})
+        m = output_identifier_meth
+        indexes = {}
         metadata_dataset.
-          with_sql("SELECT INDNAME,UNIQUERULE,MADE_UNIQUE,SYSTEM_REQUIRED FROM SYSCAT.INDEXES WHERE TABNAME = #{literal(input_identifier_meth.call(table))}").
-          all.map{|h| Hash[ h.map{|k,v| [k.to_sym, v]} ] }
+         from(:syscat__indexes).
+         select(:indname, :uniquerule, :colnames).
+         where(:tabname=>input_identifier_meth.call(table), :system_required=>0).
+         each do |r|
+          indexes[m.call(r[:indname])] = {:unique=>(r[:uniquerule]=='U'), :columns=>r[:colnames][1..-1].split('+').map{|v| m.call(v)}}
+        end
+        indexes
       end
 
       private
@@ -116,20 +123,32 @@ module Sequel
       end
 
       # Supply columns with NOT NULL if they are part of a composite
-      # primary/foreign key
+      # primary key or unique constraint
       def column_list_sql(g)
         ks = []
-        g.constraints.each{|c| ks = c[:columns] if [:primary_key, :foreign_key].include? c[:type]} 
+        g.constraints.each{|c| ks = c[:columns] if [:primary_key, :unique].include?(c[:type])} 
         g.columns.each{|c| c[:null] = false if ks.include?(c[:name]) }
         super
+      end
+
+      # Insert data from the current table into the new table after
+      # creating the table, since it is not possible to do it in one step.
+      def create_table_as(name, sql, options)
+        super
+        from(name).insert(sql.is_a?(Dataset) ? sql : dataset.with_sql(sql))
+      end
+
+      # DB2 requires parens around the SELECT, and DEFINITION ONLY at the end.
+      def create_table_as_sql(name, sql, options)
+        "#{create_table_prefix_sql(name, options)} AS (#{sql}) DEFINITION ONLY"
       end
 
       # Here we use DGTT which has most backward compatibility, which uses
       # DECLARE instead of CREATE. CGTT can only be used after version 9.7.
       # http://www.ibm.com/developerworks/data/library/techarticle/dm-0912globaltemptable/
-      def create_table_sql(name, generator, options)
+      def create_table_prefix_sql(name, options)
         if options[:temp]
-          "DECLARE GLOBAL TEMPORARY TABLE #{quote_identifier(name)} (#{column_list_sql(generator)})"
+          "DECLARE GLOBAL TEMPORARY TABLE #{quote_identifier(name)}"
         else
           super
         end
@@ -157,6 +176,11 @@ module Sequel
         "CALL ADMIN_CMD(#{literal("REORG TABLE #{table}")})"
       end
 
+      # Treat clob as blob if use_clob_as_blob is true
+      def schema_column_type(db_type)
+        (::Sequel::DB2::use_clob_as_blob && db_type.downcase == 'clob') ? :blob : super
+      end
+
       # We uses the clob type by default for Files.
       # Note: if user select to use blob, then insert statement should use 
       # use this for blob value:
@@ -170,6 +194,11 @@ module Sequel
         :smallint
       end
       alias type_literal_generic_falseclass type_literal_generic_trueclass
+
+      # DB2 uses clob for text types.
+      def uses_clob_for_text?
+        true
+      end
     end
 
     module DatasetMethods
@@ -178,6 +207,7 @@ module Sequel
       PAREN_CLOSE = Dataset::PAREN_CLOSE
       PAREN_OPEN = Dataset::PAREN_OPEN
       BITWISE_METHOD_MAP = {:& =>:BITAND, :| => :BITOR, :^ => :BITXOR, :'B~'=>:BITNOT}
+      EMULATED_FUNCTION_MAP = {:char_length=>'length'.freeze}
       BOOL_TRUE = '1'.freeze
       BOOL_FALSE = '0'.freeze
       CAST_STRING_OPEN = "RTRIM(CHAR(".freeze
@@ -214,6 +244,8 @@ module Sequel
           sql << complex_expression_arg_pairs(args){|a, b| "(#{literal(a)} * POWER(2, #{literal(b)}))"}
         when :>>
           sql << complex_expression_arg_pairs(args){|a, b| "(#{literal(a)} / POWER(2, #{literal(b)}))"}
+        when :%
+          sql << complex_expression_arg_pairs(args){|a, b| "MOD(#{literal(a)}, #{literal(b)})"}
         when :'B~'
           literal_append(sql, SQL::Function.new(:BITNOT, *args))
         when :extract
@@ -224,6 +256,16 @@ module Sequel
         else
           super
         end
+      end
+
+      # DB2 supports GROUP BY CUBE
+      def supports_group_cube?
+        true
+      end
+
+      # DB2 supports GROUP BY ROLLUP
+      def supports_group_rollup?
+        true
       end
 
       # DB2 does not support IS TRUE.
@@ -293,7 +335,7 @@ module Sequel
         if l = @opts[:limit]
           if l == 1
             sql << FETCH_FIRST_ROW_ONLY
-          elsif l > 1
+          else
             sql << FETCH_FIRST
             literal_append(sql, l)
             sql << ROWS_ONLY
